@@ -14,6 +14,13 @@ pub struct ControlSocket {
     pub socket_type: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SubnetSummary {
+    pub index: usize,
+    pub cidr: String,
+    pub reservation_count: usize,
+}
+
 pub struct KeaFile {
     pub root: Value,
 }
@@ -34,7 +41,7 @@ impl KeaFile {
     }
 
     /// 每個 subnet 的摘要（索引、CIDR、reservation 筆數），供選擇器使用。
-    pub fn subnet_list(&self) -> Vec<(usize, String, usize)> {
+    pub fn subnet_list(&self) -> Vec<SubnetSummary> {
         self.subnet4()
             .map(|arr| {
                 arr.iter()
@@ -49,7 +56,11 @@ impl KeaFile {
                             .get("reservations")
                             .and_then(Value::as_array)
                             .map_or(0, |a| a.len());
-                        (i, cidr, n)
+                        SubnetSummary {
+                            index: i,
+                            cidr,
+                            reservation_count: n,
+                        }
                     })
                     .collect()
             })
@@ -59,7 +70,7 @@ impl KeaFile {
     pub fn subnet(&self, index: usize) -> Result<Subnet> {
         let arr = self.subnet4().ok_or_else(|| anyhow!("設定檔缺少 subnet4"))?;
         let v = arr.get(index).ok_or_else(|| anyhow!("subnet 索引超出範圍: {index}"))?;
-        parse_subnet(index, v)
+        parse_subnet(v)
     }
 
     pub fn add_reservation(&mut self, subnet_index: usize, r: &Reservation) -> Result<()> {
@@ -78,7 +89,7 @@ impl KeaFile {
         let slot = res
             .get_mut(res_index)
             .ok_or_else(|| anyhow!("reservation 索引超出範圍: {res_index}"))?;
-        *slot = reservation_to_value(r);
+        apply_reservation_to_value(slot, r);
         Ok(())
     }
 
@@ -92,7 +103,7 @@ impl KeaFile {
     }
 
     pub fn control_socket(&self) -> Option<ControlSocket> {
-        let cs = self.root.get("Dhcp4")?.get("control-socket")?;
+        let cs = self.dhcp4()?.get("control-socket")?;
         Some(ControlSocket {
             socket_name: cs.get("socket-name")?.as_str()?.to_string(),
             socket_type: cs.get("socket-type")?.as_str()?.to_string(),
@@ -108,14 +119,21 @@ impl KeaFile {
         Ok(())
     }
 
+    fn dhcp4(&self) -> Option<&Value> {
+        self.root.get("Dhcp4")
+    }
+
+    fn dhcp4_mut(&mut self) -> Option<&mut Value> {
+        self.root.get_mut("Dhcp4")
+    }
+
     fn subnet4(&self) -> Option<&Vec<Value>> {
-        self.root.get("Dhcp4")?.get("subnet4")?.as_array()
+        self.dhcp4()?.get("subnet4")?.as_array()
     }
 
     fn reservations_mut(&mut self, subnet_index: usize) -> Result<&mut Vec<Value>> {
         let arr = self
-            .root
-            .get_mut("Dhcp4")
+            .dhcp4_mut()
             .and_then(|d| d.get_mut("subnet4"))
             .and_then(Value::as_array_mut)
             .ok_or_else(|| anyhow!("設定檔缺少 subnet4"))?;
@@ -129,7 +147,7 @@ impl KeaFile {
     }
 }
 
-fn parse_subnet(_index: usize, v: &Value) -> Result<Subnet> {
+fn parse_subnet(v: &Value) -> Result<Subnet> {
     let cidr_str = v
         .get("subnet")
         .and_then(Value::as_str)
@@ -196,6 +214,24 @@ fn reservation_to_value(r: &Reservation) -> Value {
         m.insert("hostname".into(), Value::String(h.clone()));
     }
     Value::Object(m)
+}
+
+/// 把 reservation 的已建模欄位套用到既有物件上，**保留未建模欄位**（ADR 0001 硬規則）。
+fn apply_reservation_to_value(slot: &mut Value, r: &Reservation) {
+    let obj = match slot.as_object_mut() {
+        Some(obj) => obj,
+        None => return,
+    };
+    obj.insert("hw-address".into(), Value::String(r.hw_address.clone()));
+    obj.insert("ip-address".into(), Value::String(r.ip_address.to_string()));
+    match r.hostname.as_ref().filter(|h| !h.is_empty()) {
+        Some(h) => {
+            obj.insert("hostname".into(), Value::String(h.clone()));
+        }
+        None => {
+            obj.remove("hostname");
+        }
+    }
 }
 
 /// 以 3 空格縮排序列化（與既有設定檔排版一致），不保留註解。
@@ -301,6 +337,46 @@ mod tests {
 
     fn fixture() -> &'static str {
         concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/kea-dhcp4.conf")
+    }
+
+    #[test]
+    fn update_preserves_unmodeled_fields() {
+        let mut f = KeaFile::load(Path::new(fixture())).unwrap();
+        f.root
+            .get_mut("Dhcp4")
+            .and_then(|d| d.get_mut("subnet4"))
+            .and_then(Value::as_array_mut)
+            .unwrap()[0]
+            .get_mut("reservations")
+            .and_then(Value::as_array_mut)
+            .unwrap()[0]
+            .as_object_mut()
+            .unwrap()
+            .insert("client-classes".into(), Value::String("voip".into()));
+        let upd = Reservation {
+            hw_address: "1c:69:7a:77:3b:98".into(),
+            ip_address: Ipv4Addr::from_str("10.1.1.99").unwrap(),
+            hostname: Some("renamed".into()),
+        };
+        f.update_reservation(0, 0, &upd).unwrap();
+        let saved = f.root["Dhcp4"]["subnet4"][0]["reservations"][0].clone();
+        assert_eq!(saved["client-classes"], "voip", "未建模欄位必須保留");
+        assert_eq!(saved["hw-address"], "1c:69:7a:77:3b:98");
+        assert_eq!(saved["ip-address"], "10.1.1.99");
+        assert_eq!(saved["hostname"], "renamed");
+    }
+
+    #[test]
+    fn update_removes_hostname_when_cleared() {
+        let mut f = KeaFile::load(Path::new(fixture())).unwrap();
+        let upd = Reservation {
+            hw_address: "1c:69:7a:77:3b:98".into(),
+            ip_address: Ipv4Addr::from_str("10.1.1.11").unwrap(),
+            hostname: None,
+        };
+        f.update_reservation(0, 0, &upd).unwrap();
+        let saved = f.root["Dhcp4"]["subnet4"][0]["reservations"][0].clone();
+        assert!(saved.get("hostname").is_none());
     }
 
     #[test]

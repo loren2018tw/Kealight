@@ -12,8 +12,8 @@ use axum::Router;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::domain::{check_conflicts, Conflict, Reservation};
-use crate::file::{backup, ControlSocket, KeaFile};
+use crate::domain::{check_conflicts, duplicate_hostnames, Conflict, Reservation};
+use crate::file::{backup, ControlSocket, KeaFile, SubnetSummary};
 use crate::reload::reload;
 
 const PAGE_SIZE: usize = 50;
@@ -58,13 +58,15 @@ async fn root(State(state): State<Shared>) -> Response {
         }
         0
     };
-    Redirect::to(&format!("/subnet/{idx}")).into_response()
+    Redirect::to(&format!("/subnet/{idx}?pick=1")).into_response()
 }
 
 #[derive(Deserialize, Default)]
 struct ListQuery {
     q: Option<String>,
     page: Option<usize>,
+    pick: Option<u8>,
+    warn: Option<String>,
 }
 
 async fn subnet_list(
@@ -140,17 +142,23 @@ fn render_subnet_list(st: &AppState, idx: usize, q: &ListQuery) -> Result<String
         }
     }
 
-    let subnet_selector = subnet_dialog(&subnets, idx);
+    let subnet_selector = subnet_dialog(&subnets, idx, q.pick == Some(1));
     let pending = st.saves_since_apply;
-    let apply_disabled = if pending == 0 { " disabled" } else { "" };
+    let (apply_disabled, apply_hint) = match st.file.control_socket() {
+        None => (" disabled", "設定檔未宣告 control-socket，無法套用"),
+        Some(_) if pending == 0 => (" disabled", ""),
+        Some(_) => ("", ""),
+    };
     let pending_html = if pending > 0 {
         format!(r#"<span class="badge">{} 筆變更尚未套用</span>"#, pending)
     } else {
         String::new()
     };
-
-    let notice = q.q.as_deref().map(|_| "").unwrap_or("");
-    let _ = notice;
+    let warn_html = q
+        .warn
+        .as_deref()
+        .map(|h| format!(r#"<p class="warn">⚠ hostname「{}」與其他 reservation 重複（未擋，僅提醒）</p>"#, escape(h)))
+        .unwrap_or_default();
     let match_phrase = if needle.is_empty() {
         String::new()
     } else {
@@ -166,10 +174,11 @@ fn render_subnet_list(st: &AppState, idx: usize, q: &ListQuery) -> Result<String
 <button class="btn primary" type="submit">搜尋</button>
 </form>
 <a class="btn primary" href="/subnet/{idx}/new">新增 reservation</a>
-<button class="btn primary{}" hx-post="/apply" hx-target="#apply-result" hx-swap="innerHTML">套用設定</button>
+<button class="btn primary{}" hx-post="/apply" hx-target="#apply-result" hx-swap="innerHTML" title="{apply_hint}">套用設定</button>
 <span id="apply-result"></span>
 {pending_html}
 </div>
+{warn_html}
 {subnet_selector}
 <p>共 {} 筆符合{}（第 {} / {} 頁）</p>
 <table>
@@ -184,28 +193,34 @@ fn render_subnet_list(st: &AppState, idx: usize, q: &ListQuery) -> Result<String
         match_phrase,
         page + 1,
         pages,
+        apply_hint = apply_hint,
     ))
 }
 
-fn subnet_dialog(subnets: &[(usize, String, usize)], current: usize) -> String {
+fn subnet_dialog(subnets: &[SubnetSummary], current: usize, auto_open: bool) -> String {
     let mut items = String::new();
-    for (i, cidr, n) in subnets {
-        let sel = if *i == current { " primary" } else { "" };
+    for s in subnets {
+        let sel = if s.index == current { " primary" } else { "" };
         items.push_str(&format!(
             r#"<li><a class="btn{sel}" href="/subnet/{i}">Subnet {i} — {cidr}（{n} 筆）</a></li>"#,
             sel = sel,
-            i = i,
-            cidr = cidr,
-            n = n,
+            i = s.index,
+            cidr = s.cidr,
+            n = s.reservation_count,
         ));
     }
+    let script = if auto_open {
+        "if (document.querySelectorAll('#subnet-dialog li').length > 1) { document.getElementById('subnet-dialog').showModal(); }"
+    } else {
+        ""
+    };
     format!(
         r#"<dialog id="subnet-dialog">
 <p><strong>選擇要編修的 subnet</strong></p>
 <ul style="list-style:none;padding:0">{items}</ul>
 <button class="btn" onclick="document.getElementById('subnet-dialog').close()">取消</button>
 </dialog>
-<script>if (document.querySelectorAll('#subnet-dialog li').length > 1) {{ document.getElementById('subnet-dialog').showModal(); }}</script>"#
+<script>{script}</script>"#
     )
 }
 
@@ -268,8 +283,9 @@ fn reservation_from_form(f: &ReservationForm) -> (Result<Reservation>, Vec<Strin
     if hw.is_empty() {
         errors.push("hw-address 不得為空".into());
     }
-    if !valid_mac(hw) {
-        errors.push(format!("hw-address 格式不合法: {}", escape(hw)));
+    let normalized_mac = normalize_mac(hw);
+    if normalized_mac.is_none() {
+        errors.push(format!("hw-address 格式不合法（需 6 組十六進位，可用 : 或 - 分隔）: {}", escape(hw)));
     }
     let ip = match Ipv4Addr::from_str(f.ip_address.trim()) {
         Ok(ip) => ip,
@@ -281,7 +297,11 @@ fn reservation_from_form(f: &ReservationForm) -> (Result<Reservation>, Vec<Strin
     let hostname = f.hostname.as_ref().map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
     if errors.is_empty() {
         (
-            Ok(Reservation { hw_address: hw.to_lowercase(), ip_address: ip, hostname }),
+            Ok(Reservation {
+                hw_address: normalized_mac.expect("validated above"),
+                ip_address: ip,
+                hostname,
+            }),
             errors,
         )
     } else {
@@ -289,16 +309,19 @@ fn reservation_from_form(f: &ReservationForm) -> (Result<Reservation>, Vec<Strin
     }
 }
 
-fn valid_mac(s: &str) -> bool {
-    let hex = s.split(':');
-    let mut count = 0;
-    for part in hex {
-        if part.len() != 2 || !part.chars().all(|c| c.is_ascii_hexdigit()) {
-            return false;
-        }
-        count += 1;
+/// 接受 `:` 或 `-` 分隔的 6 組 MAC，正規化為小寫冒號格式；否則回傳 None。
+fn normalize_mac(s: &str) -> Option<String> {
+    let parts: Vec<&str> = if s.contains(':') {
+        s.split(':').collect()
+    } else if s.contains('-') {
+        s.split('-').collect()
+    } else {
+        return None;
+    };
+    if parts.len() != 6 || parts.iter().any(|p| p.len() != 2 || !p.chars().all(|c| c.is_ascii_hexdigit())) {
+        return None;
     }
-    count == 6
+    Some(parts.join(":").to_lowercase())
 }
 
 fn conflict_messages(c: &[Conflict]) -> Vec<String> {
@@ -317,11 +340,32 @@ async fn create_reservation(
     Path(idx): Path<usize>,
     Form(form): Form<ReservationForm>,
 ) -> Response {
+    submit_reservation(state, idx, None, form).await
+}
+
+async fn update_reservation(
+    State(state): State<Shared>,
+    Path((idx, ridx)): Path<(usize, usize)>,
+    Form(form): Form<ReservationForm>,
+) -> Response {
+    submit_reservation(state, idx, Some(ridx), form).await
+}
+
+/// 新增（ridx=None）或修改（ridx=Some）共用的提交流程：表單校驗 → 衝突檢查 → 寫檔 → 帶警告重新導向。
+async fn submit_reservation(
+    state: Shared,
+    idx: usize,
+    ridx: Option<usize>,
+    form: ReservationForm,
+) -> Response {
     let (parsed, form_errors) = reservation_from_form(&form);
     let mut st = state.lock().await;
     let Ok(subnet) = st.file.subnet(idx) else {
         return page_500("subnet 不存在");
     };
+    if ridx.is_some_and(|r| r >= subnet.reservations.len()) {
+        return page_500("reservation 不存在");
+    }
     let reservation = match parsed {
         Ok(r) => r,
         Err(_) => {
@@ -332,26 +376,34 @@ async fn create_reservation(
             };
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Html(page("表單不合法", &form_html(idx, None, Some(&dummy), &form_errors, &[]))),
+                Html(page("表單不合法", &form_html(idx, ridx, Some(&dummy), &form_errors, &[]))),
             )
                 .into_response();
         }
     };
-    let conflicts = check_conflicts(&subnet, &reservation, None);
+    let conflicts = check_conflicts(&subnet, &reservation, ridx);
     if !conflicts.is_empty() {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Html(page("衝突", &form_html(idx, None, Some(&reservation), &conflict_messages(&conflicts), &[]))),
+            Html(page("衝突", &form_html(idx, ridx, Some(&reservation), &conflict_messages(&conflicts), &[]))),
         )
             .into_response();
     }
-    if let Err(e) = st.file.add_reservation(idx, &reservation) {
+    let result = match ridx {
+        Some(r) => st.file.update_reservation(idx, r, &reservation),
+        None => st.file.add_reservation(idx, &reservation),
+    };
+    if let Err(e) = result {
         return page_500(&e.to_string());
     }
     if let Err(e) = st.save_locked() {
         return page_500(&e.to_string());
     }
-    Redirect::to(&format!("/subnet/{idx}")).into_response()
+    let mut redirect = format!("/subnet/{idx}");
+    if let Some(dup) = duplicate_hostnames(&subnet, &reservation, ridx).first() {
+        redirect.push_str(&format!("?warn={}", urlencode(dup)));
+    }
+    Redirect::to(&redirect).into_response()
 }
 
 async fn new_form(State(state): State<Shared>, Path(idx): Path<usize>) -> Response {
@@ -375,51 +427,6 @@ async fn edit_form(
         Some(r) => (StatusCode::OK, Html(page("編輯", &form_html(idx, Some(ridx), Some(r), &[], &[])))).into_response(),
         None => page_500("reservation 不存在"),
     }
-}
-
-async fn update_reservation(
-    State(state): State<Shared>,
-    Path((idx, ridx)): Path<(usize, usize)>,
-    Form(form): Form<ReservationForm>,
-) -> Response {
-    let (parsed, form_errors) = reservation_from_form(&form);
-    let mut st = state.lock().await;
-    let Ok(subnet) = st.file.subnet(idx) else {
-        return page_500("subnet 不存在");
-    };
-    if ridx >= subnet.reservations.len() {
-        return page_500("reservation 不存在");
-    }
-    let reservation = match parsed {
-        Ok(r) => r,
-        Err(_) => {
-            let dummy = Reservation {
-                hw_address: form.hw_address.trim().to_lowercase(),
-                ip_address: form.ip_address.trim().parse().unwrap_or(Ipv4Addr::UNSPECIFIED),
-                hostname: form.hostname.as_ref().map(|h| h.trim().to_string()).filter(|h| !h.is_empty()),
-            };
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Html(page("表單不合法", &form_html(idx, Some(ridx), Some(&dummy), &form_errors, &[]))),
-            )
-                .into_response();
-        }
-    };
-    let conflicts = check_conflicts(&subnet, &reservation, Some(ridx));
-    if !conflicts.is_empty() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Html(page("衝突", &form_html(idx, Some(ridx), Some(&reservation), &conflict_messages(&conflicts), &[]))),
-        )
-            .into_response();
-    }
-    if let Err(e) = st.file.update_reservation(idx, ridx, &reservation) {
-        return page_500(&e.to_string());
-    }
-    if let Err(e) = st.save_locked() {
-        return page_500(&e.to_string());
-    }
-    Redirect::to(&format!("/subnet/{idx}")).into_response()
 }
 
 async fn delete_reservation(
@@ -729,6 +736,58 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("沒有待套用的變更"));
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_with_duplicate_hostname_redirects_with_warning() {
+        let (app, p) = test_app();
+        let (status, _) = post_form(
+            &app,
+            "/subnet/0/new",
+            "hw_address=aa%3Abb%3Acc%3Add%3Aee%3A07&ip_address=10.1.9.7&hostname=chufang-mg4670-3",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (status, body) = get(&app, "/subnet/0?warn=chufang-mg4670-3").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("與其他 reservation 重複"), "body: {body}");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn apply_button_disabled_without_control_socket() {
+        let dir = std::env::temp_dir().join(format!(
+            "kealight-web-nocs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("kea-dhcp4.conf");
+        std::fs::copy(fixture(), &p).unwrap();
+        let mut f = KeaFile::load(&p).unwrap();
+        f.root.as_object_mut().unwrap().get_mut("Dhcp4").unwrap().as_object_mut().unwrap().remove("control-socket");
+        let state = AppState { kea_path: p.clone(), backup_keep: 3, file: f, saves_since_apply: 1 };
+        let app = app(state);
+        let (status, body) = get(&app, "/subnet/0").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"title="設定檔未宣告 control-socket，無法套用""#), "body: {body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mac_with_dashes_is_normalized() {
+        let (app, p) = test_app();
+        let (status, _) = post_form(
+            &app,
+            "/subnet/0/new",
+            "hw_address=AA-BB-CC-DD-EE-08&ip_address=10.1.9.8",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let reloaded = KeaFile::load(&p).unwrap();
+        let last = reloaded.subnet(0).unwrap().reservations.last().unwrap().clone();
+        assert_eq!(last.hw_address, "aa:bb:cc:dd:ee:08");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     #[tokio::test]

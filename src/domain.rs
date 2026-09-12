@@ -65,8 +65,8 @@ pub fn check_conflicts(
     conflicts
 }
 
-/// hostname 重複只是警告（不擋寫入），回傳重複到的其他 hostname。
-#[cfg(test)]
+/// hostname 重複只是警告（不擋寫入）。若候選的 hostname 已存在於其他 reservation，
+/// 回傳該 hostname（供 UI 顯示警告）。
 pub fn duplicate_hostnames(subnet: &Subnet, candidate: &Reservation, edit_index: Option<usize>) -> Vec<String> {
     let mut dupes = Vec::new();
     let Some(cand) = candidate.hostname.as_deref() else {
