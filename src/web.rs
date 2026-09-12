@@ -10,8 +10,12 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use axum_extra::extract::CookieJar;
+use axum_extra::extract::cookie::Cookie;
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tower_layer::Layer;
+use tower_service::Service;
 
 use crate::domain::{check_conflicts, duplicate_hostnames, Conflict, Reservation};
 use crate::file::{backup, file_stat, FileStat, KeaFile, LeaseDb, SubnetSummary};
@@ -42,12 +46,14 @@ pub struct AppState {
     pub saves_since_apply: u64,
     /// 上次載入／寫回時的檔案 stat 基準（mtime 奈秒＋大小）
     pub baseline_stat: Option<FileStat>,
+    /// 共享密碼（空字串時不啟用認證）
+    pub password: String,
 }
 
 impl AppState {
     /// 載入 kea 設定檔並在**載入當下**建立 stat 基準——
     /// 否則「啟動後、首次請求前」的外部修改會因基準為空而漏判（ADR 0003）。
-    pub fn load(kea_path: PathBuf, backup_keep: usize) -> Result<AppState> {
+    pub fn load(kea_path: PathBuf, backup_keep: usize, password: String) -> Result<AppState> {
         let file = KeaFile::load(&kea_path)?;
         let baseline_stat = match file_stat(&kea_path) {
             Ok(s) => s,
@@ -59,6 +65,7 @@ impl AppState {
             file,
             saves_since_apply: 0,
             baseline_stat,
+            password,
         })
     }
 
@@ -130,6 +137,7 @@ impl AppState {
 }
 
 pub fn app(state: AppState) -> Router {
+    let password = state.password.clone();
     let state = Arc::new(Mutex::new(state));
     Router::new()
         .route("/", get(root))
@@ -142,7 +150,74 @@ pub fn app(state: AppState) -> Router {
         .route("/external/adopt", post(external_adopt))
         .route("/external/overwrite", post(external_overwrite))
         .route("/static/htmx.min.js", get(|| async { ([("Content-Type", "application/javascript")], HTMX_JS) }))
+        .route("/login", get(login_page).post(login_submit))
         .with_state(state)
+        .layer(AuthLayer { password })
+}
+
+const AUTH_COOKIE: &str = "auth";
+
+#[derive(Clone)]
+struct AuthLayer {
+    password: String,
+}
+
+impl<S> Layer<S> for AuthLayer {
+    type Service = AuthMiddleware<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        AuthMiddleware {
+            inner,
+            password: self.password.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AuthMiddleware<S> {
+    inner: S,
+    password: String,
+}
+
+impl<S, B> Service<axum::http::Request<B>> for AuthMiddleware<S>
+where
+    S: Service<axum::http::Request<B>, Response = Response> + Clone + Send + 'static,
+    S::Future: Send,
+    B: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
+        let path = req.uri().path().to_string();
+        let needs_auth = path != "/login" && !path.starts_with("/static/");
+
+        if !needs_auth || self.password.is_empty() {
+            let fut = self.inner.call(req);
+            return Box::pin(fut);
+        }
+
+        let jar = CookieJar::from_headers(req.headers());
+        let authenticated = jar.get(AUTH_COOKIE).map(|c| c.value() == "ok").unwrap_or(false);
+
+        if authenticated {
+            let fut = self.inner.call(req);
+            return Box::pin(fut);
+        }
+
+        let uri = req.uri();
+        let next = if let Some(q) = uri.query() {
+            format!("{}?{}", uri.path(), q)
+        } else {
+            uri.path().to_string()
+        };
+        let redirect = Redirect::to(&format!("/login?next={}", urlencode(&next)));
+        Box::pin(async move { Ok(redirect.into_response()) })
+    }
 }
 
 type Shared = Arc<Mutex<AppState>>;
@@ -156,6 +231,65 @@ async fn root(State(state): State<Shared>) -> Response {
         0
     };
     Redirect::to(&format!("/subnet/{idx}?pick=1")).into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginPageQuery {
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    password: String,
+    next: Option<String>,
+}
+
+async fn login_page(Query(q): Query<LoginPageQuery>) -> Response {
+    let next_val = q.next.as_deref().unwrap_or("/");
+    let body = format!(
+        r#"<div class="bar"><h1 style="margin:0">登入</h1></div>
+<form method="post" action="/login" class="bar" style="flex-direction:column;align-items:flex-start;max-width:24rem">
+<label>密碼<br><input name="password" type="password" required autofocus style="width:100%"></label>
+<input type="hidden" name="next" value="{}">
+<div class="bar" style="margin-top:.5rem">
+<button class="btn primary" type="submit">登入</button>
+</div>
+</form>"#,
+        escape(next_val),
+    );
+    (StatusCode::OK, Html(page("登入", &body))).into_response()
+}
+
+async fn login_submit(
+    State(state): State<Shared>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let password_ok = {
+        let st = state.lock().await;
+        st.password == form.password
+    };
+    if !password_ok {
+        let next_val = form.next.as_deref().unwrap_or("/");
+        let body = format!(
+            r#"<div class="bar"><h1 style="margin:0">登入</h1></div>
+<p class="err">密碼錯誤</p>
+<form method="post" action="/login" class="bar" style="flex-direction:column;align-items:flex-start;max-width:24rem">
+<label>密碼<br><input name="password" type="password" required autofocus style="width:100%"></label>
+<input type="hidden" name="next" value="{}">
+<div class="bar" style="margin-top:.5rem">
+<button class="btn primary" type="submit">登入</button>
+</div>
+</form>"#,
+            escape(next_val),
+        );
+        return (StatusCode::UNAUTHORIZED, Html(page("登入", &body))).into_response();
+    }
+    let next_path = form.next.as_deref().unwrap_or("/");
+    let mut cookie = Cookie::new(AUTH_COOKIE, "ok");
+    cookie.set_http_only(true);
+    cookie.set_same_site(axum_extra::extract::cookie::SameSite::Lax);
+    let redirect = Redirect::to(next_path);
+    (CookieJar::new().add(cookie), redirect).into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -1449,6 +1583,9 @@ fn page(title: &str, body: &str) -> String {
 <script src="/static/htmx.min.js" defer></script>
 <style>
 body {{ font-family: system-ui, sans-serif; margin: 2rem; background:#f6f7f9; color:#222; }}
+header.topbar {{ background: linear-gradient(120deg, #1f6feb, #2c8c4f); color:#fff; padding:1rem 1.5rem; border-radius:10px; margin-bottom:1.5rem; display:flex; align-items:center; gap:1rem; box-shadow:0 2px 6px rgba(0,0,0,.15); }}
+header.topbar .tb-title {{ margin:0; font-size:1.5rem; font-weight:700; line-height:1.1; }}
+header.topbar .tb-sub {{ margin:0; margin-top:.15rem; font-size:.9rem; opacity:.92; }}
 table {{ border-collapse: collapse; width: 100%; background:#fff; }}
 th, td {{ border: 1px solid #d4d7dd; padding: .4rem .6rem; text-align: left; font-size: .92rem; }}
 th {{ background:#eef0f4; }}
@@ -1465,7 +1602,14 @@ th {{ background:#eef0f4; }}
 nav.tabs {{ display:flex; gap:.5rem; align-items:center; margin-bottom:1rem; flex-wrap:wrap; }}
 .inline-form {{ display:inline; }}
 dialog {{ border:1px solid #b8bdc7; border-radius:8px; padding:1.25rem; }}
-</style></head><body>{body}</body></html>"#
+</style></head><body>
+<header class="topbar">
+<div>
+<h1 class="tb-title">Kealight</h1>
+<p class="tb-sub">極速 kea dhcp 設定工具</p>
+</div>
+</header>
+{body}</body></html>"#
     )
 }
 
@@ -1536,6 +1680,7 @@ mod tests {
             file,
             saves_since_apply: 0,
             baseline_stat: baseline_of(&p),
+            password: String::new(),
         };
         (
             app(state).layer(MockConnectInfo(SocketAddr::from((
@@ -1911,6 +2056,7 @@ mod tests {
             file: f,
             saves_since_apply: 1,
             baseline_stat: baseline_of(&p),
+            password: String::new(),
         };
         let app = app(state);
         let (status, body) = get(&app, "/subnet/0").await;
@@ -2140,6 +2286,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
+    #[tokio::test]
+    async fn pages_show_title_bar() {
+        let (app, dir) = test_app();
+        let (_, subnet) = get(&app, "/subnet/0").await;
+        let (_, leases) = get(&app, "/leases").await;
+        for body in [subnet, leases] {
+            assert!(body.contains(r##"<header class="topbar">"##), "頁面應含標題列：{body}");
+            assert!(body.contains("Kealight"), "標題列應顯示專案名稱：{body}");
+            assert!(body.contains("極速 kea dhcp 設定工具"), "標題列應顯示副標題：{body}");
+        }
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
     /// 建立租用分頁測試環境：kea 設定檔的 lease-database.name 指向同目錄 CSV，
     /// 並寫入樣本租用檔。
     fn lease_test_app() -> (Router, std::path::PathBuf, std::path::PathBuf) {
@@ -2178,6 +2337,7 @@ mod tests {
             file: KeaFile::load(&p).unwrap(),
             saves_since_apply: 0,
             baseline_stat: baseline_of(&p),
+            password: String::new(),
         };
         (app(state), p, lease_path)
     }
@@ -2266,6 +2426,7 @@ mod tests {
             file: f,
             saves_since_apply: 0,
             baseline_stat: baseline,
+            password: String::new(),
         };
         let app_missing = app(state);
         let (status, body) = get(&app_missing, "/leases").await;
@@ -2290,6 +2451,7 @@ mod tests {
             file: f,
             saves_since_apply: 0,
             baseline_stat: baseline,
+            password: String::new(),
         };
         let app2 = app(state);
         let (_, body) = get(&app2, "/leases").await;

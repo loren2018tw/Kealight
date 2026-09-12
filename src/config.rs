@@ -16,6 +16,9 @@ pub struct KealightConfig {
     /// 寫回前保留的備份份數
     #[serde(default = "default_backup_keep")]
     pub backup_keep: usize,
+    /// 共享密碼（空字串或缺省時不啟用認證）
+    #[serde(default)]
+    pub password: String,
 }
 
 fn default_bind() -> String {
@@ -49,6 +52,7 @@ kea_config = "testdata/kea-dhcp4.conf"
 bind = "0.0.0.0"
 port = 9000
 backup_keep = 5
+password = "secret"
 "#;
         let dir = std::env::temp_dir().join(format!("kealight-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -59,6 +63,7 @@ backup_keep = 5
         assert_eq!(cfg.bind, "0.0.0.0");
         assert_eq!(cfg.port, 9000);
         assert_eq!(cfg.backup_keep, 5);
+        assert_eq!(cfg.password, "secret");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -73,6 +78,7 @@ backup_keep = 5
         assert_eq!(cfg.bind, "127.0.0.1");
         assert_eq!(cfg.port, 7777);
         assert_eq!(cfg.backup_keep, 10);
+        assert_eq!(cfg.password, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

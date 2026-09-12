@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("kealight.toml"));
     let cfg = config::load(&config_path)?;
-    let state = web::AppState::load(cfg.kea_config, cfg.backup_keep)?;
+    let state = web::AppState::load(cfg.kea_config, cfg.backup_keep, cfg.password)?;
     let app = web::app(state).into_make_service_with_connect_info::<SocketAddr>();
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

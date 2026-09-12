@@ -31,3 +31,7 @@ subnet 內由 Kea 自動發放的 IP 範圍（如 10.1.11.1 - 10.1.11.250）。r
 **Conflict（衝突）**:
 違反唯一性或範圍規則的狀況：hw-address 重複、IP 被其他 reservation 佔用、IP 落入 dynamic pool、IP 超出 subnet 範圍。v1 一律拒絕寫入。
 _Avoid_: 錯誤、重複（重複只是衝突的一種）
+
+**Credential（憑證）**:
+用於驗證操作者身分的共享密碼，設定於 `kealight.toml` 的 `password` 欄位。不與特定用戶綁定，為全站共用。密碼為空字串或缺省時不啟用認證。
+_Avoid_: 密碼、auth（僅口語）
