@@ -2247,7 +2247,7 @@ mod tests {
 
     #[tokio::test]
     async fn leases_page_reports_non_memfile_and_missing_file() {
-        let (r, dir) = test_app();
+        let (_r, dir) = test_app();
         // name 指向一個確定不存在的路徑 → 「租用檔不存在」空狀態（不依賴部署環境）。
         let missing = std::env::temp_dir().join(format!("kealight-nope-{}", std::process::id()));
         let mut f = KeaFile::load(&dir).unwrap();
