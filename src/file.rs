@@ -14,9 +14,43 @@ pub struct ControlSocket {
     pub socket_type: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStat {
+    pub mtime_ns: u64,
+    pub size: u64,
+}
+
+/// 讀取檔案的 stat（mtime 奈秒＋大小）。檔案不存在（或無權限）回 None。
+pub fn file_stat(path: &Path) -> Result<Option<FileStat>> {
+    let Ok(m) = std::fs::metadata(path) else {
+        return Ok(None);
+    };
+    let Ok(mtime) = m.modified() else {
+        return Ok(Some(FileStat { mtime_ns: 0, size: m.len() }));
+    };
+    let ns = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow!("讀取修改時間失敗: {e}"))?
+        .as_nanos();
+    Ok(Some(FileStat {
+        mtime_ns: u64::try_from(ns).unwrap_or(0),
+        size: m.len(),
+    }))
+}
+
+/// memfile 租用資料庫的解析結果（ADR 0004）。
+#[derive(Debug, Clone)]
+pub enum LeaseDb {
+    /// type = memfile，租用檔路徑已解析
+    Memfile(PathBuf),
+    /// 無法由 kea 設定檔得知租用檔位置（附說明文字）
+    Unavailable(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct SubnetSummary {
     pub index: usize,
+    pub id: Option<u32>,
     pub cidr: String,
     pub reservation_count: usize,
 }
@@ -40,7 +74,7 @@ impl KeaFile {
         self.subnet4().map_or(0, |a| a.len())
     }
 
-    /// 每個 subnet 的摘要（索引、CIDR、reservation 筆數），供選擇器使用。
+    /// 每個 subnet 的摘要（索引、id、CIDR、reservation 筆數），供選擇器與租用過濾使用。
     pub fn subnet_list(&self) -> Vec<SubnetSummary> {
         self.subnet4()
             .map(|arr| {
@@ -52,12 +86,17 @@ impl KeaFile {
                             .and_then(Value::as_str)
                             .unwrap_or("?")
                             .to_string();
+                        let id = v
+                            .get("id")
+                            .and_then(Value::as_i64)
+                            .and_then(|n| u32::try_from(n).ok());
                         let n = v
                             .get("reservations")
                             .and_then(Value::as_array)
                             .map_or(0, |a| a.len());
                         SubnetSummary {
                             index: i,
+                            id,
                             cidr,
                             reservation_count: n,
                         }
@@ -65,6 +104,26 @@ impl KeaFile {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// 全部 subnet 的 reservation hw-address（小寫冒號格式），供租用列標記「保留」徽章。
+    pub fn reservation_hwaddrs(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(arr) = self.subnet4() else {
+            return out;
+        };
+        for s in arr.iter() {
+            let Some(res) = s.get("reservations").and_then(Value::as_array) else {
+                continue;
+            };
+            for r in res.iter() {
+                let Some(hw) = r.get("hw-address").and_then(Value::as_str) else {
+                    continue;
+                };
+                out.push(hw.to_string());
+            }
+        }
+        out
     }
 
     pub fn subnet(&self, index: usize) -> Result<Subnet> {
@@ -108,6 +167,33 @@ impl KeaFile {
             socket_name: cs.get("socket-name")?.as_str()?.to_string(),
             socket_type: cs.get("socket-type")?.as_str()?.to_string(),
         })
+    }
+
+    /// 解析租用資料庫路徑（ADR 0004）：
+    /// 區段缺失或 type 非 memfile → Unavailable；memfile 無 name → 內建預設；
+    /// name 含 '/' → 照字面；裸檔名 → 與預設目錄組合。
+    pub fn lease_db(&self) -> LeaseDb {
+        let default_dir = Path::new("/var/lib/kea");
+        let Some(dhcp4) = self.dhcp4() else {
+            return LeaseDb::Unavailable("設定檔缺少 Dhcp4 區段，無法顯示租用".into());
+        };
+        let Some(db) = dhcp4.get("lease-database") else {
+            return LeaseDb::Unavailable("設定檔缺少 lease-database 區段，無法顯示租用".into());
+        };
+        let Some(ty) = db.get("type").and_then(Value::as_str) else {
+            return LeaseDb::Unavailable("設定檔 lease-database 缺少 type，無法顯示租用".into());
+        };
+        if *ty != *"memfile" {
+            return LeaseDb::Unavailable(format!("租用資料庫型別「{ty}」非 memfile，無法顯示租用"));
+        }
+        let Some(name) = db.get("name").and_then(Value::as_str) else {
+            return LeaseDb::Memfile(default_dir.join("kea-leases4.csv"));
+        };
+        if name.contains('/') {
+            LeaseDb::Memfile(PathBuf::from(name.to_string()))
+        } else {
+            LeaseDb::Memfile(default_dir.join(name.to_string()))
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -486,5 +572,103 @@ mod tests {
         let cs = f.control_socket().expect("control socket");
         assert_eq!(cs.socket_type, "unix");
         assert_eq!(cs.socket_name, "/run/kea/kea4-ctrl-socket");
+    }
+
+    #[test]
+    fn file_stat_missing_returns_none() {
+        let dir = std::env::temp_dir().join(format!("kealight-stat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("nope.conf");
+        assert!(file_stat(&p).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_stat_reads_size_and_mtime() {
+        let dir = std::env::temp_dir().join(format!("kealight-stat2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.conf");
+        std::fs::write(&p, "hello").unwrap();
+        let st = file_stat(&p).unwrap().expect("stat exists");
+        assert_eq!(st.size, 5);
+        assert!(st.mtime_ns > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lease_db_default_path_when_memfile_without_name() {
+        let f = KeaFile::load(Path::new(fixture())).unwrap();
+        match f.lease_db() {
+            LeaseDb::Memfile(p) => assert_eq!(p, PathBuf::from("/var/lib/kea/kea-leases4.csv")),
+            other => panic!("fixture 的 memfile 未宣告 name 應回預設路徑: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lease_db_rejects_non_memfile() {
+        let mut f = KeaFile::load(Path::new(fixture())).unwrap();
+        f.root
+            .get_mut("Dhcp4")
+            .unwrap()
+            .get_mut("lease-database")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("type".into(), Value::String("mysql".into()));
+        match f.lease_db() {
+            LeaseDb::Unavailable(msg) => assert!(msg.contains("非 memfile"), "msg: {msg}"),
+            other => panic!("非 memfile 應回 Unavailable: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lease_db_bare_name_joins_default_dir() {
+        let mut f = KeaFile::load(Path::new(fixture())).unwrap();
+        f.root
+            .get_mut("Dhcp4")
+            .unwrap()
+            .get_mut("lease-database")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("name".into(), Value::String("custom.csv".into()));
+        match f.lease_db() {
+            LeaseDb::Memfile(p) => assert_eq!(p, PathBuf::from("/var/lib/kea/custom.csv")),
+            other => panic!("裸檔名應與預設目錄組合: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lease_db_path_with_slash_used_literally() {
+        let mut f = KeaFile::load(Path::new(fixture())).unwrap();
+        f.root
+            .get_mut("Dhcp4")
+            .unwrap()
+            .get_mut("lease-database")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("name".into(), Value::String("/tmp/x/leases.csv".into()));
+        match f.lease_db() {
+            LeaseDb::Memfile(p) => assert_eq!(p, PathBuf::from("/tmp/x/leases.csv")),
+            other => panic!("含 / 的 name 應照字面使用: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subnet_list_carries_ids() {
+        let f = KeaFile::load(Path::new(fixture())).unwrap();
+        let summaries = f.subnet_list();
+        assert_eq!(summaries[0].id, Some(1));
+        assert_eq!(summaries[0].cidr, "10.1.0.0/16");
+        assert_eq!(summaries[0].reservation_count, 239);
+    }
+
+    #[test]
+    fn reservation_hwaddrs_collects_all() {
+        let f = KeaFile::load(Path::new(fixture())).unwrap();
+        let hws = f.reservation_hwaddrs();
+        assert_eq!(hws.len(), 239);
+        assert!(hws.contains(&"1c:69:7a:77:3b:98".into()));
     }
 }

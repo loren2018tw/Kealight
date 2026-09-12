@@ -1,6 +1,7 @@
 mod config;
 mod domain;
 mod file;
+mod leases;
 mod reload;
 mod web;
 
@@ -14,13 +15,7 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("kealight.toml"));
     let cfg = config::load(&config_path)?;
-    let file = file::KeaFile::load(&cfg.kea_config)?;
-    let state = web::AppState {
-        kea_path: cfg.kea_config,
-        backup_keep: cfg.backup_keep,
-        file,
-        saves_since_apply: 0,
-    };
+    let state = web::AppState::load(cfg.kea_config, cfg.backup_keep)?;
     let app = web::app(state).into_make_service_with_connect_info::<SocketAddr>();
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

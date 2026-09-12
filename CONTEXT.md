@@ -1,13 +1,18 @@
 # Kealight — Kea DHCP Reservation Editor
 
-Rust 撰寫的前後端一體工具，編輯 Kea DHCP4 設定檔中的主機保留（reservation）。v1 聚焦既有 subnet 內單筆 reservation 的新增、修改、刪除與查詢。
+Rust 撰寫的前後端一體工具，編輯 Kea DHCP4 設定檔中的主機保留（reservation）。v1 聚焦既有 subnet 內單筆 reservation 的新增、修改、刪除與查詢，另提供 memfile 租用（lease）的唯讀檢視，以及 kea 設定檔（可能被外部系統編輯）的外部修改偵測。
 
 ## Language
 
 **Reservation（主機保留）**:
 一筆靜態 DHCP 綁定：以 hw-address 為身分，對應一個 ip-address，可附 hostname，隸屬於某個 subnet。
 身分鍵分兩層：**邏輯身分鍵**為 hw-address（唯一性語意所在）；**操作錨**（編輯／刪除時選定哪一筆的方式）由實作決定，v1 使用未過濾清單的陣列位置。
-_Avoid_: 靜態 DHCP 項目、host entry、lease
+_Avoid_: 靜態 DHCP 項目、host entry、租用（lease 是不同概念，見下）
+
+**Lease（租用）**:
+Kea 執行期的暫態 DHCP 記錄，代表一個目前（或最近）被實際發放的綁定；以 memfile 的 CSV（每 server 一個檔）為儲存。以數字 state（0=已指派、1=declined、2=expired-reclaimed、3=released、4=registered）與 expire（epoch 秒）判定狀態；同一 address 可能有多列（append-only），讀取應取最後一列。
+與 reservation 的關係：reservation 是設定檔中的靜態意圖，lease 是執行結果；保留位址被實際發放後會以 state=0 的 lease 出現。Kealight 對 lease 一律唯讀，不寫回。
+_Avoid_: 動態保留、binding
 
 **Subnet（子網）**:
 承載 reservations 的容器（如 10.1.0.0/16），同時界定 reservation 的 IP 合法範圍。v1 中視為唯讀，僅作為編輯目標的選擇單位。
