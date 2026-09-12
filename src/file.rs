@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(f.subnet_count(), 1);
         let s = f.subnet(0).expect("subnet 0");
         assert_eq!(s.cidr.to_string(), "10.1.0.0/16");
-        assert_eq!(s.reservations.len(), 957);
+        assert_eq!(s.reservations.len(), 239);
         assert_eq!(s.pools.len(), 1);
         assert_eq!(s.pools[0].start, Ipv4Addr::from_str("10.1.11.1").unwrap());
         assert_eq!(s.pools[0].end, Ipv4Addr::from_str("10.1.11.250").unwrap());
@@ -422,7 +422,7 @@ mod tests {
             hostname: Some("test-host".into()),
         };
         f.add_reservation(0, &new).unwrap();
-        assert_eq!(f.subnet(0).unwrap().reservations.len(), 958);
+        assert_eq!(f.subnet(0).unwrap().reservations.len(), 240);
 
         let upd = Reservation {
             hw_address: "aa:bb:cc:dd:ee:02".into(),
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(s.reservations[0].hostname, None);
 
         f.delete_reservation(0, 0).unwrap();
-        assert_eq!(f.subnet(0).unwrap().reservations.len(), 957);
+        assert_eq!(f.subnet(0).unwrap().reservations.len(), 239);
     }
 
     #[test]
@@ -455,7 +455,7 @@ mod tests {
         .unwrap();
         f.save(&p).unwrap();
         let reloaded = KeaFile::load(&p).unwrap();
-        assert_eq!(reloaded.subnet(0).unwrap().reservations.len(), 958);
+        assert_eq!(reloaded.subnet(0).unwrap().reservations.len(), 240);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

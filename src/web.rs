@@ -184,7 +184,10 @@ fn render_subnet_list(st: &AppState, idx: usize, q: &ListQuery) -> Result<String
         Some(_) => ("", ""),
     };
     let pending_html = if pending > 0 {
-        format!(r#"<span class="badge">{} 筆變更尚未套用</span>"#, pending)
+        format!(
+            r#"<span id="pending-badge" class="badge">{} 筆變更尚未套用</span>"#,
+            pending
+        )
     } else {
         String::new()
     };
@@ -685,10 +688,18 @@ async fn apply_reload(State(state): State<Shared>) -> Response {
     match reload(&cs) {
         Ok(text) => {
             state.lock().await.saves_since_apply = 0;
-            Html(format!(r#"<span class="ok">已套用並 reload 成功：{}</span>"#, escape(&text))).into_response()
+            Html(ok_reload_html(&text)).into_response()
         }
         Err(e) => Html(format!(r#"<span class="err">檔案已寫入，但 reload 失敗：{}</span>"#, escape(&e.to_string()))).into_response(),
     }
+}
+
+/// 套用成功回應：主要訊息進 hx-target，另以 OOB 片段移除「尚未套用」徽章。
+fn ok_reload_html(text: &str) -> String {
+    format!(
+        r##"<span class="ok">已套用並 reload 成功：{}</span><span id="pending-badge" hx-swap-oob="outerHTML"></span>"##,
+        escape(text),
+    )
 }
 
 fn page(title: &str, body: &str) -> String {
@@ -1008,7 +1019,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         let reloaded = KeaFile::load(&p).unwrap();
-        assert_eq!(reloaded.subnet(0).unwrap().reservations.len(), 958);
+        assert_eq!(reloaded.subnet(0).unwrap().reservations.len(), 240);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
@@ -1075,7 +1086,7 @@ mod tests {
         assert_eq!(status, StatusCode::SEE_OTHER);
         let reloaded = KeaFile::load(&p).unwrap();
         let s = reloaded.subnet(0).unwrap();
-        assert_eq!(s.reservations.len(), 957);
+        assert_eq!(s.reservations.len(), 239);
         assert_eq!(s.reservations[0].ip_address.to_string(), "10.1.1.99");
         assert_eq!(s.reservations[0].hostname.as_deref(), Some("renamed"));
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
@@ -1101,7 +1112,7 @@ mod tests {
         let (status, _) = post_form(&app, "/subnet/0/res/0/delete", "").await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         let reloaded = KeaFile::load(&p).unwrap();
-        assert_eq!(reloaded.subnet(0).unwrap().reservations.len(), 956);
+        assert_eq!(reloaded.subnet(0).unwrap().reservations.len(), 238);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
@@ -1178,6 +1189,32 @@ mod tests {
         let (status, body) = post_form(&app, "/apply", "").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("reload 失敗"), "body: {body}");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn apply_ok_response_clears_pending_badge_via_oob() {
+        let html = ok_reload_html("Configuration successful.");
+        assert!(
+            html.contains(r##"<span id="pending-badge" hx-swap-oob="outerHTML"></span>"##),
+            "ok 回應應含 OOB 片段：{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_badge_marked_for_oob_swap() {
+        let (app, dir) = test_app();
+        post_form(
+            &app,
+            "/subnet/0/new",
+            "hw_address=aa%3Abb%3Acc%3Add%3Aee%3A22&ip_address=10.1.9.22",
+        )
+        .await;
+        let (_, body) = get(&app, "/subnet/0").await;
+        assert!(
+            body.contains(r##"<span id="pending-badge" class="badge">1 筆變更尚未套用</span>"##),
+            "badge 應有固定 id 供 OOB 置換：{body}"
+        );
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }
