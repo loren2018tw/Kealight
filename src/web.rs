@@ -801,7 +801,7 @@ hx-get="/leases" hx-trigger="input changed delay:200ms" hx-target="#lease-panel"
 <div id="lease-panel">
 <p>共 {} 筆符合{}{}</p>
 <table>
-<thead><tr><th>address</th>{th_html}<th>subnet</th><th>state</th><th>到期</th><th>保留</th></tr></thead>
+<thead><tr>{th_html}<th>subnet</th><th>state</th><th>到期</th><th>保留</th></tr></thead>
 <tbody>{rows_html}</tbody>
 </table>
 <p>{pager}</p>
@@ -2233,9 +2233,29 @@ mod tests {
     #[tokio::test]
     async fn leases_page_reports_non_memfile_and_missing_file() {
         let (r, dir) = test_app();
-        let (status, body) = get(&r, "/leases").await;
+        // name 指向一個確定不存在的路徑 → 「租用檔不存在」空狀態（不依賴部署環境）。
+        let missing = std::env::temp_dir().join(format!("kealight-nope-{}", std::process::id()));
+        let mut f = KeaFile::load(&dir).unwrap();
+        f.root
+            .get_mut("Dhcp4")
+            .unwrap()
+            .get_mut("lease-database")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("name".into(), Value::String(missing.to_string_lossy().to_string().into()));
+        let baseline = baseline_of(&dir);
+        let state = AppState {
+            kea_path: dir.clone(),
+            backup_keep: 3,
+            file: f,
+            saves_since_apply: 0,
+            baseline_stat: baseline,
+        };
+        let app_missing = app(state);
+        let (status, body) = get(&app_missing, "/leases").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("租用檔不存在"), "未宣告 name 應回預設路徑並顯示空狀態：{body}");
+        assert!(body.contains("租用檔不存在"), "name 指向不存在的檔案應顯示空狀態：{body}");
 
         let mut f = KeaFile::load(&dir).unwrap();
         f.root
