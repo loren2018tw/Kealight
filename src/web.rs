@@ -753,6 +753,8 @@ fn render_leases(st: &AppState, q: &LeasesQuery, refresh: &Refresh) -> Result<St
         .map_err(|e| anyhow::anyhow!("取得時間失敗: {e}"))?
         .as_secs() as u64;
     let cur_state = q.state.as_deref().map(|s| s.to_string()).unwrap_or_default();
+    let unreserved_only = cur_state == "unreserved";
+    let state_filter = if unreserved_only { "active" } else { cur_state.as_str() };
     let subnet_sel: Option<u32> = q
         .subnet
         .as_deref()
@@ -763,6 +765,13 @@ fn render_leases(st: &AppState, q: &LeasesQuery, refresh: &Refresh) -> Result<St
             None => true,
             Some(sid) => l.subnet_id == Some(sid),
         }
+    };
+    let hwaddrs = st.file.reservation_hwaddrs();
+    let is_reserved = |l: &Lease| -> bool {
+        l.hwaddr
+            .as_deref()
+            .map(|h| hwaddrs.contains(&h.to_lowercase()))
+            .unwrap_or(false)
     };
     let needle = q.q.clone().unwrap_or_default().trim().to_lowercase();
     let matches = |l: &Lease| -> bool {
@@ -784,7 +793,12 @@ fn render_leases(st: &AppState, q: &LeasesQuery, refresh: &Refresh) -> Result<St
     let mut filtered: Vec<(usize, &Lease)> = leases
         .iter()
         .enumerate()
-        .filter(|(_, l)| matches_state_filter(l, &cur_state, now) && matches_subnet(l) && matches(l))
+        .filter(|(_, l)| {
+            matches_state_filter(l, state_filter, now)
+                && (!unreserved_only || !is_reserved(l))
+                && matches_subnet(l)
+                && matches(l)
+        })
         .collect();
     let sort_field = q
         .sort
@@ -800,17 +814,12 @@ fn render_leases(st: &AppState, q: &LeasesQuery, refresh: &Refresh) -> Result<St
     let rows = &filtered[start..end];
 
     let subnets = st.file.subnet_list();
-    let hwaddrs = st.file.reservation_hwaddrs();
     let mut rows_html = String::new();
     if rows.is_empty() {
         rows_html.push_str(r#"<tr><td colspan="7"><p>沒有符合的租用</p></td></tr>"#);
     }
     for (_, l) in rows.iter() {
-        let reserved = l
-            .hwaddr
-            .as_deref()
-            .map(|h| hwaddrs.contains(&h.to_lowercase()))
-            .unwrap_or(false);
+        let reserved = is_reserved(l);
         let badge = if reserved {
             r#"<span class="badge">保留</span>"#
         } else {
@@ -872,6 +881,7 @@ fn render_leases(st: &AppState, q: &LeasesQuery, refresh: &Refresh) -> Result<St
     };
     let mut state_select = String::new();
     state_select.push_str(&state_opts("active", "作用中"));
+    state_select.push_str(&state_opts("unreserved", "非保留"));
     state_select.push_str(&state_opts("all", "全部"));
     state_select.push_str(&state_opts("expired", "已過期"));
     state_select.push_str(&state_opts("declined", "拒絕"));
@@ -2384,6 +2394,20 @@ mod tests {
             body.contains("10.1.8.185") && body.contains("已過期"),
             "過期列應顯示「已過期」標籤：{body}"
         );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn leases_page_unreserved_filter_hides_reserved_leases() {
+        let (app, dir, _) = lease_test_app();
+        let (_, body) = get(&app, "/leases").await;
+        assert!(body.contains(r##"<option value="unreserved">非保留</option>"##), "下拉應有非保留選項：{body}");
+        let (_, body) = get(&app, "/leases?state=unreserved").await;
+        assert!(
+            body.contains("10.1.1.13") && body.contains("10.1.6.30"),
+            "非保留應含無 reservation 的租用：{body}"
+        );
+        assert!(!body.contains("10.1.9.9"), "非保留不應含保留租用：{body}");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
