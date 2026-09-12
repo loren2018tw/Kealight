@@ -6,6 +6,7 @@ Rust 撰寫的前後端一體工具，編輯 Kea DHCP4 設定檔中的主機保�
 
 **Reservation（主機保留）**:
 一筆靜態 DHCP 綁定：以 hw-address 為身分，對應一個 ip-address，可附 hostname，隸屬於某個 subnet。
+身分鍵分兩層：**邏輯身分鍵**為 hw-address（唯一性語意所在）；**操作錨**（編輯／刪除時選定哪一筆的方式）由實作決定，v1 使用未過濾清單的陣列位置。
 _Avoid_: 靜態 DHCP 項目、host entry、lease
 
 **Subnet（子網）**:

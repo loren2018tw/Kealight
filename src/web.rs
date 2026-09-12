@@ -1,10 +1,11 @@
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Result;
 use axum::extract::{Form, Path, Query, State};
+use axum::extract::connect_info::ConnectInfo;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -67,6 +68,8 @@ struct ListQuery {
     page: Option<usize>,
     pick: Option<u8>,
     warn: Option<String>,
+    sort: Option<String>,
+    dir: Option<String>,
 }
 
 async fn subnet_list(
@@ -97,15 +100,46 @@ fn render_subnet_list(st: &AppState, idx: usize, q: &ListQuery) -> Result<String
             || r.ip_address.to_string().contains(&needle)
             || r.hostname.as_deref().unwrap_or("").to_lowercase().contains(&needle)
     };
-    let filtered: Vec<&Reservation> = subnet.reservations.iter().filter(|r| matches(r)).collect();
+    let mut filtered: Vec<(usize, &Reservation)> = subnet
+        .reservations
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| matches(r))
+        .collect();
+    let sort_field = q
+        .sort
+        .as_deref()
+        .map(|s| s.to_string())
+        .filter(|s| s == "hw-address" || s == "ip-address" || s == "hostname");
+    if let Some(sf) = q.sort.clone()
+        && (sf == "hw-address" || sf == "ip-address" || sf == "hostname")
+    {
+        let desc = q.dir.as_deref().map(|d| *d == *"desc").unwrap_or(false);
+        filtered.sort_by_key(|(orig, r)| sort_key_bytes(r, &sf, desc, *orig));
+    }
     let total = filtered.len();
-    let pages = total.div_ceil(PAGE_SIZE);
-    let page = q.page.unwrap_or(0).min(pages.saturating_sub(1));
-    let rows = &filtered[page * PAGE_SIZE..total.min((page + 1) * PAGE_SIZE)];
+    let searching = !needle.is_empty();
+    let pages = if searching {
+        1
+    } else {
+        total.div_ceil(PAGE_SIZE)
+    };
+    let page = if searching {
+        0
+    } else {
+        q.page.unwrap_or(0).min(pages.saturating_sub(1))
+    };
+    let start = if searching { 0 } else { page * PAGE_SIZE };
+    let end = if searching {
+        total
+    } else {
+        total.min(start + PAGE_SIZE)
+    };
+    let rows = &filtered[start..end];
 
     let mut rows_html = String::new();
-    for (i, r) in rows.iter().enumerate() {
-        let global = page * PAGE_SIZE + i;
+    for (orig, r) in rows.iter() {
+        let global = *orig;
         let hw = escape(&r.hw_address);
         let ip = r.ip_address.to_string();
         let hostname = escape(r.hostname.as_deref().unwrap_or(""));
@@ -164,15 +198,55 @@ fn render_subnet_list(st: &AppState, idx: usize, q: &ListQuery) -> Result<String
     } else {
         format!("「{}」", escape(&needle))
     };
+    let page_phrase = if searching {
+        String::new()
+    } else {
+        format!("（第 {} / {} 頁）", page + 1, pages)
+    };
+    let mut th_html = String::new();
+    th_html.push_str(&th_link(
+        "hw-address",
+        "hw-address",
+        idx,
+        &sort_field,
+        q.dir.as_deref(),
+    ));
+    th_html.push_str(&th_link(
+        "ip-address",
+        "ip-address",
+        idx,
+        &sort_field,
+        q.dir.as_deref(),
+    ));
+    th_html.push_str(&th_link(
+        "hostname",
+        "hostname",
+        idx,
+        &sort_field,
+        q.dir.as_deref(),
+    ));
+    let sort_vals = match sort_field {
+        Some(sf) => {
+            let d = if q.dir.as_deref().map(|x| *x == *"desc").unwrap_or(false) {
+                "desc"
+            } else {
+                "asc"
+            };
+            format!(
+                r#" hx-vals='{{"sort":"{sf}","dir":"{d}"}}'"#,
+                sf = sf,
+                d = d,
+            )
+        }
+        None => String::new(),
+    };
 
     Ok(format!(
         r##"<div class="bar">
 <h1 style="margin:0">Subnet {idx} — {}</h1>
 <button class="btn" onclick="document.getElementById('subnet-dialog').showModal()">切換 subnet</button>
-<form class="bar" method="get" action="/subnet/{idx}" style="margin:0">
-<input type="search" name="q" value="{}" placeholder="搜尋 hostname / IP / hw-address" style="flex:1;min-width:260px">
-<button class="btn primary" type="submit">搜尋</button>
-</form>
+<input type="search" name="q" value="{}" placeholder="搜尋 hostname / IP / hw-address（即時篩選）" style="flex:1;min-width:260px"
+hx-get="/subnet/{idx}" hx-trigger="input changed delay:200ms" hx-target="#list-panel" hx-select="#list-panel" hx-swap="outerHTML"{sort_vals}>
 <a class="btn primary" href="/subnet/{idx}/new">新增 reservation</a>
 <button class="btn primary{}" hx-post="/apply" hx-target="#apply-result" hx-swap="innerHTML" title="{apply_hint}">套用設定</button>
 <span id="apply-result"></span>
@@ -180,19 +254,20 @@ fn render_subnet_list(st: &AppState, idx: usize, q: &ListQuery) -> Result<String
 </div>
 {warn_html}
 {subnet_selector}
-<p>共 {} 筆符合{}（第 {} / {} 頁）</p>
+<div id="list-panel">
+<p>共 {} 筆符合{}{}</p>
 <table>
-<thead><tr><th>#</th><th>hw-address</th><th>ip-address</th><th>hostname</th><th>動作</th></tr></thead>
+<thead><tr><th>#</th>{th_html}<th>動作</th></tr></thead>
 <tbody>{rows_html}</tbody>
 </table>
-<p>{pager}</p>"##,
+<p>{pager}</p>
+</div>"##,
         escape(&subnet.cidr.to_string()),
         escape(&needle),
         apply_disabled,
         total,
         match_phrase,
-        page + 1,
-        pages,
+        page_phrase,
         apply_hint = apply_hint,
     ))
 }
@@ -224,10 +299,29 @@ fn subnet_dialog(subnets: &[SubnetSummary], current: usize, auto_open: bool) -> 
     )
 }
 
-fn form_html(idx: usize, ridx: Option<usize>, r: Option<&Reservation>, errors: &[String], warnings: &[String]) -> String {
+fn form_html(
+    idx: usize,
+    ridx: Option<usize>,
+    r: Option<&Reservation>,
+    errors: &[String],
+    warnings: &[String],
+    peer_mac: Option<String>,
+) -> String {
     let (hw, ip, hostname) = match r {
-        Some(r) => (r.hw_address.clone(), r.ip_address.to_string(), r.hostname.clone().unwrap_or_default()),
+        Some(r) => (
+            r.hw_address.clone(),
+            r.ip_address.to_string(),
+            r.hostname.clone().unwrap_or_default(),
+        ),
         None => (String::new(), String::new(), String::new()),
+    };
+    let peer_hint = match peer_mac {
+        Some(m) => format!(
+            r##"<span class="hint">目前連線主機 MAC：{m}（可供手動填入）</span>"##,
+            m = escape(m.as_str()),
+        ),
+        None => r##"<span class="hint">無法取得連線主機 MAC（需與本系統同一層網路）</span>"##
+            .to_string(),
     };
     let action = match ridx {
         Some(ri) => format!("/subnet/{idx}/res/{ri}/edit"),
@@ -256,7 +350,7 @@ fn form_html(idx: usize, ridx: Option<usize>, r: Option<&Reservation>, errors: &
         r#"<div class="bar"><h1 style="margin:0">{title} — Subnet {idx}</h1></div>
 {errs}{warns}
 <form method="post" action="{action}" class="bar" style="flex-direction:column;align-items:flex-start;max-width:32rem">
-<label>hw-address（MAC，唯一鍵）<br><input name="hw_address" value="{}" required placeholder="1c:69:7a:77:3b:98" style="width:100%"></label>
+<label>hw-address（MAC，唯一鍵）<br><input name="hw_address" value="{}" required placeholder="1c:69:7a:77:3b:98" style="width:100%"><br>{peer_hint}</label>
 <label>ip-address<br><input name="ip_address" value="{}" required placeholder="10.1.1.11" style="width:100%"></label>
 <label>hostname（選用）<br><input name="hostname" value="{}" style="width:100%"></label>
 <div class="bar" style="margin-top:.5rem">
@@ -309,6 +403,104 @@ fn reservation_from_form(f: &ReservationForm) -> (Result<Reservation>, Vec<Strin
     }
 }
 
+/// 排序鍵：v1 全序唯一，不依賴 sort_by_key 的穩定性。
+/// 前綴 0=有值 / 1=無值（無 hostname 者恆排尾，升降冪皆然）；
+/// desc 時 payload 逐 byte 補數（反向排序但不動 None 尾）；尾綴原始索引做穩定 tie-breaker。
+fn sort_key_bytes(r: &Reservation, sort: &str, desc: bool, orig: usize) -> Vec<u8> {
+    let (present, payload) = match sort {
+        "ip-address" => (
+            true,
+            r.ip_address
+                .to_string()
+                .split('.')
+                .map(|p| format!("{:0>3}", p))
+                .collect::<Vec<String>>()
+                .join("."),
+        ),
+        "hw-address" => (true, r.hw_address.to_lowercase()),
+        _ => (
+            r.hostname.is_some(),
+            r.hostname
+                .as_deref()
+                .map(|h| h.to_lowercase())
+                .unwrap_or_default(),
+        ),
+    };
+    let mut key: Vec<u8> = Vec::new();
+    key.push(if present { 0 } else { 1 });
+    let payload_bytes: Vec<u8> = payload.bytes().collect();
+    for b in payload_bytes {
+        key.push(if desc { 0xFF - b } else { b });
+    }
+    key.push((orig >> 24) as u8);
+    key.push((orig >> 16) as u8);
+    key.push((orig >> 8) as u8);
+    key.push(orig as u8);
+    key
+}
+
+/// 欄名排序連結：三態（asc → desc → 無排序），以 ▲/▼ 標示目前方向；
+/// 以 htmx 只替換 #list-panel 並保留搜尋詞（hx-include 輸入框 q）。
+fn th_link(
+    field: &str,
+    label: &str,
+    idx: usize,
+    cur_sort: &Option<String>,
+    cur_dir: Option<&str>,
+) -> String {
+    let is_current = cur_sort.as_deref().map(|s| *s == *field).unwrap_or(false);
+    let desc = cur_dir.map(|d| *d == *"desc").unwrap_or(false);
+    let marker = if is_current {
+        if desc { " ▼" } else { " ▲" }
+    } else {
+        ""
+    };
+    let href = if !is_current {
+        format!("/subnet/{idx}?sort={field}&dir=asc")
+    } else if desc {
+        format!("/subnet/{idx}")
+    } else {
+        format!("/subnet/{idx}?sort={field}&dir=desc")
+    };
+    format!(
+        r##"<th><a href="{href}" hx-get="{href}" hx-include="[name='q']" hx-target="#list-panel" hx-select="#list-panel" hx-swap="outerHTML">{label}{marker}</a></th>"##,
+        href = href,
+        label = label,
+        marker = marker,
+    )
+}
+
+/// 解析 `/proc/net/arp` 文字，反查 target_ip 對應的 MAC。
+/// 標題列、incomplete（00:00:00:00:00:00）或無命中皆回傳 None。
+fn mac_from_arp_table(table: &str, target_ip: &str) -> Option<String> {
+    for line in table.split('\n') {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.len() < 4 || words[0] == "IP" {
+            continue;
+        }
+        if words[0] == target_ip && words[3] != "00:00:00:00:00:00" {
+            return Some(words[3].to_string());
+        }
+    }
+    None
+}
+
+/// 讀取本機 ARP 表，反查操作主機（連線來源）的 MAC。
+/// 瀏覽器拿不到本機 MAC，但操作主機與本系統在同一層網路（同廣播域）時，
+/// 伺服器可從自身 ARP 表反查連線來源 IP。跨網段、VPN 或 bind localhost 時查不到。
+fn peer_mac(peer: &SocketAddr) -> Option<String> {
+    match peer.ip() {
+        IpAddr::V4(ip) => {
+            let text = std::fs::read_to_string(PathBuf::from("/proc/net/arp"));
+            let Ok(table) = text else {
+                return None;
+            };
+            mac_from_arp_table(&table, &ip.to_string())
+        }
+        IpAddr::V6(_) => None,
+    }
+}
+
 /// 接受 `:` 或 `-` 分隔的 6 組 MAC，正規化為小寫冒號格式；否則回傳 None。
 fn normalize_mac(s: &str) -> Option<String> {
     let parts: Vec<&str> = if s.contains(':') {
@@ -337,18 +529,20 @@ fn conflict_messages(c: &[Conflict]) -> Vec<String> {
 
 async fn create_reservation(
     State(state): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(idx): Path<usize>,
     Form(form): Form<ReservationForm>,
 ) -> Response {
-    submit_reservation(state, idx, None, form).await
+    submit_reservation(state, idx, None, form, ConnectInfo(peer)).await
 }
 
 async fn update_reservation(
     State(state): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path((idx, ridx)): Path<(usize, usize)>,
     Form(form): Form<ReservationForm>,
 ) -> Response {
-    submit_reservation(state, idx, Some(ridx), form).await
+    submit_reservation(state, idx, Some(ridx), form, ConnectInfo(peer)).await
 }
 
 /// 新增（ridx=None）或修改（ridx=Some）共用的提交流程：表單校驗 → 衝突檢查 → 寫檔 → 帶警告重新導向。
@@ -357,8 +551,10 @@ async fn submit_reservation(
     idx: usize,
     ridx: Option<usize>,
     form: ReservationForm,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
     let (parsed, form_errors) = reservation_from_form(&form);
+    let host_mac = peer_mac(&peer);
     let mut st = state.lock().await;
     let Ok(subnet) = st.file.subnet(idx) else {
         return page_500("subnet 不存在");
@@ -376,7 +572,10 @@ async fn submit_reservation(
             };
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Html(page("表單不合法", &form_html(idx, ridx, Some(&dummy), &form_errors, &[]))),
+                Html(page(
+                    "表單不合法",
+                    &form_html(idx, ridx, Some(&dummy), &form_errors, &[], host_mac.clone()),
+                )),
             )
                 .into_response();
         }
@@ -385,7 +584,17 @@ async fn submit_reservation(
     if !conflicts.is_empty() {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Html(page("衝突", &form_html(idx, ridx, Some(&reservation), &conflict_messages(&conflicts), &[]))),
+            Html(page(
+                "衝突",
+                &form_html(
+                    idx,
+                    ridx,
+                    Some(&reservation),
+                    &conflict_messages(&conflicts),
+                    &[],
+                    host_mac.clone(),
+                ),
+            )),
         )
             .into_response();
     }
@@ -406,16 +615,28 @@ async fn submit_reservation(
     Redirect::to(&redirect).into_response()
 }
 
-async fn new_form(State(state): State<Shared>, Path(idx): Path<usize>) -> Response {
+async fn new_form(
+    State(state): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(idx): Path<usize>,
+) -> Response {
     let st = state.lock().await;
     if st.file.subnet(idx).is_err() {
         return page_500("subnet 不存在");
     }
-    (StatusCode::OK, Html(page("新增", &form_html(idx, None, None, &[], &[])))).into_response()
+    (
+        StatusCode::OK,
+        Html(page(
+            "新增",
+            &form_html(idx, None, None, &[], &[], peer_mac(&peer)),
+        )),
+    )
+        .into_response()
 }
 
 async fn edit_form(
     State(state): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path((idx, ridx)): Path<(usize, usize)>,
 ) -> Response {
     let st = state.lock().await;
@@ -424,7 +645,14 @@ async fn edit_form(
         Err(_) => return page_500("subnet 不存在"),
     };
     match subnet.reservations.get(ridx) {
-        Some(r) => (StatusCode::OK, Html(page("編輯", &form_html(idx, Some(ridx), Some(r), &[], &[])))).into_response(),
+        Some(r) => (
+            StatusCode::OK,
+            Html(page(
+                "編輯",
+                &form_html(idx, Some(ridx), Some(r), &[], &[], peer_mac(&peer)),
+            )),
+        )
+            .into_response(),
         None => page_500("reservation 不存在"),
     }
 }
@@ -481,6 +709,7 @@ th {{ background:#eef0f4; }}
 .err {{ color:#b00020; }}
 .ok {{ color:#0a7d32; }}
 .warn {{ color:#8a6d00; }}
+.hint {{ color:#68707a; font-size:.85rem; }}
 .badge {{ background:#d3f0d3; border-radius:8px; padding:.1rem .5rem; font-size:.8rem; }}
 dialog {{ border:1px solid #b8bdc7; border-radius:8px; padding:1.25rem; }}
 </style></head><body>{body}</body></html>"#
@@ -518,6 +747,7 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::connect_info::MockConnectInfo;
     use axum::http::{header, Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -544,7 +774,13 @@ mod tests {
             file,
             saves_since_apply: 0,
         };
-        (app(state), p)
+        (
+            app(state).layer(MockConnectInfo(SocketAddr::from((
+                [198, 51, 100, 99],
+                12345,
+            )))),
+            p,
+        )
     }
 
     async fn get(app: &Router, uri: &str) -> (StatusCode, String) {
@@ -602,6 +838,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
+    #[test]
+    fn arp_table_lookup_hits_and_misses() {
+        let table = "IP address       HW type     Flags       HW address            Mask     Device\n\
+10.1.1.2         0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0\n\
+10.1.1.3         0x1         0x0         00:00:00:00:00:00     *        eth0";
+        assert_eq!(
+            mac_from_arp_table(&table, "10.1.1.2"),
+            Some("aa:bb:cc:dd:ee:ff".into())
+        );
+        assert!(
+            mac_from_arp_table(&table, "10.1.1.3").is_none(),
+            "incomplete（00:00:00:00:00:00）應視為查無"
+        );
+        assert!(
+            mac_from_arp_table(&table, "10.9.9.9").is_none(),
+            "無命中的 IP 應回 None"
+        );
+    }
+
+    #[test]
+    fn form_renders_peer_mac_hint() {
+        let html = form_html(0, None, None, &[], &[], Some("aa:bb:cc:dd:ee:ff".into()));
+        assert!(
+            html.contains("目前連線主機 MAC：aa:bb:cc:dd:ee:ff（可供手動填入）"),
+            "form: {html}"
+        );
+        let html = form_html(0, None, None, &[], &[], None);
+        assert!(
+            html.contains("無法取得連線主機 MAC（需與本系統同一層網路）"),
+            "form: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_form_shows_peer_mac_hint() {
+        let (app, dir) = test_app();
+        let (status, body) = get(&app, "/subnet/0/res/0/edit").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("連線主機 MAC"),
+            "編輯表單應顯示連線主機 MAC 的提示或查無提示：{body}"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
     #[tokio::test]
     async fn search_filters_rows() {
         let (app, dir) = test_app();
@@ -613,11 +894,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn searched_list_edit_urls_use_real_indexes() {
+        let (app, p) = test_app();
+        let f = KeaFile::load(&p).unwrap();
+        let mut needled = None;
+        for (i, r) in f.subnet(0).unwrap().reservations.iter().enumerate() {
+            if r.hostname.as_deref() == Some("chufang-mg4670-3") {
+                needled = Some(i);
+                break;
+            }
+        }
+        let ridx = needled.expect("fixture 應含 chufang-mg4670-3");
+        let (status, body) = get(&app, "/subnet/0?q=mg4670-3").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(&format!("/subnet/0/res/{ridx}/edit")),
+            "編輯應指向真實索引 {ridx}：{body}"
+        );
+        assert!(
+            body.contains(&format!("/subnet/0/res/{ridx}/delete")),
+            "刪除應指向真實索引 {ridx}：{body}"
+        );
+        assert!(
+            !body.contains(&format!("/subnet/0/res/{}/edit", ridx + 1)),
+            "不得以過濾後位置充當索引：{body}"
+        );
+        assert!(
+            !body.contains(&format!("/subnet/0/res/{}/delete", ridx + 1)),
+            "不得以過濾後位置充當索引：{body}"
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn new_form_renders() {
         let (app, dir) = test_app();
         let (status, body) = get(&app, "/subnet/0/new").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("hw_address"));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn sort_by_ip_orders_numerically() {
+        let (app, p) = test_app();
+        let f = KeaFile::load(&p).unwrap();
+        let mut ips: Vec<(u32, String)> = Vec::new();
+        for r in f.subnet(0).unwrap().reservations {
+            ips.push((u32::from(r.ip_address), r.hw_address.clone()));
+        }
+        ips.sort_by_key(|(v, _)| *v);
+        let (_, hw_min) = &ips[0];
+        let (_, hw_snd) = &ips[1];
+        let (status, body) = get(&app, "/subnet/0?sort=ip-address").await;
+        assert_eq!(status, StatusCode::OK);
+        let pos_min = body.find(hw_min.as_str()).expect("最小 IP 應出現於排序頁");
+        let pos_snd = body
+            .find(hw_snd.as_str())
+            .expect("第二小 IP 應出現於排序頁");
+        assert!(
+            pos_min < pos_snd,
+            "ip-address 應依數值排序：{hw_min} 須先於 {hw_snd}，body: {body}"
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn sort_header_cycles_and_marks() {
+        let (app, dir) = test_app();
+        let (status, body) = get(&app, "/subnet/0?sort=hostname").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("hostname ▲"), "asc 應標 ▲：{body}");
+        assert!(!body.contains("hostname ▼"));
+        assert!(
+            body.contains(r##"href="/subnet/0?sort=hostname&dir=desc""##),
+            "升冪再點應切到 desc：{body}"
+        );
+        let (_, body) = get(&app, "/subnet/0?sort=hostname&dir=desc").await;
+        assert!(body.contains("hostname ▼"), "desc 應標 ▼：{body}");
+        assert!(
+            body.contains(r##"href="/subnet/0" hx-get="/subnet/0""##),
+            "第三態（再點回無排序）不應帶 sort 參數：{body}"
+        );
+        let (status, body) = get(&app, "/subnet/0?sort=evil").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains(" ▲") && !body.contains(" ▼"),
+            "無效 sort 應忽略且無標記：{body}"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn search_input_keeps_current_sort() {
+        let (app, dir) = test_app();
+        let (status, body) = get(&app, "/subnet/0?q=chufang&sort=ip-address&dir=desc").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(r#"hx-vals='{"sort":"ip-address","dir":"desc"}'"#),
+            "即時搜尋請求應帶當前排序：{body}"
+        );
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 

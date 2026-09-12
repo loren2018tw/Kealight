@@ -4,6 +4,7 @@ mod file;
 mod reload;
 mod web;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -20,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
         file,
         saves_since_apply: 0,
     };
-    let app = web::app(state);
+    let app = web::app(state).into_make_service_with_connect_info::<SocketAddr>();
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("Kealight 監聽 http://{addr}");
