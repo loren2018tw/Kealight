@@ -568,7 +568,7 @@ struct LeasesQuery {
     q: Option<String>,
     page: Option<usize>,
     state: Option<String>,
-    subnet: Option<u32>,
+    subnet: Option<String>,
     sort: Option<String>,
     dir: Option<String>,
 }
@@ -619,10 +619,15 @@ fn render_leases(st: &AppState, q: &LeasesQuery, refresh: &Refresh) -> Result<St
         .map_err(|e| anyhow::anyhow!("取得時間失敗: {e}"))?
         .as_secs() as u64;
     let cur_state = q.state.as_deref().map(|s| s.to_string()).unwrap_or_default();
+    let subnet_sel: Option<u32> = q
+        .subnet
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u32>().ok());
     let matches_subnet = |l: &Lease| -> bool {
-        match q.subnet.as_ref() {
+        match subnet_sel {
             None => true,
-            Some(sid) => l.subnet_id == Some(*sid),
+            Some(sid) => l.subnet_id == Some(sid),
         }
     };
     let needle = q.q.clone().unwrap_or_default().trim().to_lowercase();
@@ -737,7 +742,7 @@ fn render_leases(st: &AppState, q: &LeasesQuery, refresh: &Refresh) -> Result<St
     state_select.push_str(&state_opts("expired", "已過期"));
     state_select.push_str(&state_opts("declined", "拒絕"));
     state_select.push_str(&state_opts("released", "已釋放"));
-    let all_sel = if q.subnet.is_none() { " selected" } else { "" };
+    let all_sel = if subnet_sel.is_none() { " selected" } else { "" };
     let mut subnet_opts = String::new();
     subnet_opts.push_str(&format!(
         r#"<option value=""{all_sel}>全部 subnet</option>"#,
@@ -745,7 +750,7 @@ fn render_leases(st: &AppState, q: &LeasesQuery, refresh: &Refresh) -> Result<St
     ));
     for s in subnets.iter() {
         if let Some(sid) = s.id {
-            let sel = if q.subnet.as_ref() == Some(&sid) { " selected" } else { "" };
+            let sel = if subnet_sel == Some(sid) { " selected" } else { "" };
             subnet_opts.push_str(&format!(
                 r#"<option value="{sid}"{sel}>{cidr}（{n} 筆 reservation）</option>"#,
                 sel = sel,
@@ -761,7 +766,7 @@ fn render_leases(st: &AppState, q: &LeasesQuery, refresh: &Refresh) -> Result<St
             let url = leases_page_url(&q, Some(p));
             let cls = if p == page { " primary" } else { "" };
             pager.push_str(&format!(
-                r##"<a class="btn{cls}" href="{url}" hx-get="{url}" hx-include="[name='q'],[name='state'],[name='subnet']" hx-target="#lease-panel" hx-select="#lease-panel" hx-swap="outerHTML">{label}</a> "##,
+                r##"<a class="btn{cls}" href="{url}" hx-get="{url}" hx-target="#lease-panel" hx-select="#lease-panel" hx-swap="outerHTML">{label}</a> "##,
                 cls = cls,
                 url = escape(&url),
                 label = p + 1,
@@ -795,7 +800,7 @@ fn render_leases(st: &AppState, q: &LeasesQuery, refresh: &Refresh) -> Result<St
 {subnet_opts}
 </select>
 <input type="search" name="q" value="{}" placeholder="搜尋 address / hwaddr / hostname（即時篩選）" style="flex:1;min-width:260px"
-hx-get="/leases" hx-trigger="input changed delay:200ms" hx-target="#lease-panel" hx-select="#lease-panel" hx-swap="outerHTML"{sort_vals}>
+hx-get="/leases" hx-trigger="input changed delay:200ms" hx-target="#lease-panel" hx-select="#lease-panel" hx-swap="outerHTML" hx-include="[name='state'],[name='subnet']"{sort_vals}>
 </div>
 {empty_state}
 <div id="lease-panel">
@@ -879,7 +884,7 @@ fn leases_th_link(field: &str, label: &str, q: &LeasesQuery) -> String {
         format!("{base}sort={field}&dir=desc")
     };
     format!(
-        r##"<th><a href="{href}" hx-get="{href}" hx-include="[name='q'],[name='state'],[name='subnet']" hx-target="#lease-panel" hx-select="#lease-panel" hx-swap="outerHTML">{label}{marker}</a></th>"##,
+        r##"<th><a href="{href}" hx-get="{href}" hx-target="#lease-panel" hx-select="#lease-panel" hx-swap="outerHTML">{label}{marker}</a></th>"##,
         href = escape(&href),
         label = label,
         marker = marker,
@@ -895,7 +900,7 @@ fn leases_base_href(q: &LeasesQuery) -> String {
     if let Some(v) = q.state.as_ref().filter(|s| !s.is_empty()) {
         params.push(format!("state={}", urlencode(v)));
     }
-    if let Some(v) = q.subnet.as_ref() {
+    if let Some(v) = q.subnet.as_ref().filter(|s| !s.is_empty()) {
         params.push(format!("subnet={v}"));
     }
     if params.is_empty() {
@@ -914,7 +919,7 @@ fn leases_page_url(q: &LeasesQuery, page: Option<usize>) -> String {
     if let Some(v) = q.state.as_ref().filter(|s| !s.is_empty()) {
         params.push(format!("state={}", urlencode(v)));
     }
-    if let Some(v) = q.subnet.as_ref() {
+    if let Some(v) = q.subnet.as_ref().filter(|s| !s.is_empty()) {
         params.push(format!("subnet={v}"));
     }
     if let Some(p) = page {
@@ -2195,6 +2200,16 @@ mod tests {
         let (_, body) = get(&app, "/leases?q=no-hw").await;
         assert!(!body.contains("10.1.9.9"), "搜尋應過濾：{body}");
         assert!(body.contains("10.1.1.13"), "body: {body}");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn leases_page_tolerates_empty_query_params() {
+        let (app, dir, _) = lease_test_app();
+        let (status, _) = get(&app, "/leases?state=expired&subnet=&q=").await;
+        assert_eq!(status, StatusCode::OK, "空 subnet/q 不得回 400");
+        let (status, body) = get(&app, "/leases?sort=address&dir=asc&state=expired&subnet=&q=").await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
