@@ -12,5 +12,8 @@ echo "[1/5] 編譯 release ..."
 cargo build --release --manifest-path "$(dirname "$0")/Cargo.toml"
 
 echo "[2/5] 安裝到 $INSTALL_DIR ..."
+
+systemctl stop kealight.service
 mkdir -p "$INSTALL_DIR"
 cp "$(dirname "$0")/target/release/kealight" "$INSTALL_DIR/kealight"
+systemctl start kealight.service
