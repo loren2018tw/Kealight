@@ -1,0 +1,11 @@
+# Kealight 設定檔（放執行目錄，檔名 kealight.toml）
+
+# kea 設定檔路徑（必填）
+kea_config = "/etc/kea/kea-dhcp4.conf"
+
+# HTTP 監聽位址與埠（預設 127.0.0.1:7777）
+bind = "127.0.0.1"
+port = 7777
+
+# 每次寫回前自動備份，保留最近 N 份
+backup_keep = 10
