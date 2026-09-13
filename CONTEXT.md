@@ -19,7 +19,7 @@ _Avoid_: 動態保留、binding
 _Avoid_: 網段（僅口語）
 
 **hw-address**:
-reservation 的身分鍵（MAC）。同一設定檔內不得重複。
+reservation 的身分鍵（MAC）。唯一性以 subnet 為界：單筆新增／編輯時的衝突檢查在 subnet 內比對，同一 subnet 內不得重複；快貼（paste）語境則以 hw-address 為覆寫（upsert）鍵，相符即更新而非衝突。
 _Avoid_: MAC、硬體位址（僅口語）
 
 **hostname**:
@@ -29,8 +29,12 @@ reservation 的選用名稱欄位，不具唯一性。
 subnet 內由 Kea 自動發放的 IP 範圍（如 10.1.11.1 - 10.1.11.250）。reservation 的 IP 不得落入此範圍。
 
 **Conflict（衝突）**:
-違反唯一性或範圍規則的狀況：hw-address 重複、IP 被其他 reservation 佔用、IP 落入 dynamic pool、IP 超出 subnet 範圍。v1 一律拒絕寫入。
+違反唯一性或範圍規則的狀況：hw-address 重複、IP 被其他 reservation 佔用、IP 落入 dynamic pool、IP 超出 subnet 範圍。單筆新增／編輯時一律拒絕寫入；重複的 hostname 僅警告不擋。快貼（paste）語境下 hw-address 重複不構成 Conflict，而是以匯入值覆寫既有筆。
 _Avoid_: 錯誤、重複（重複只是衝突的一種）
+
+**Paste（快貼）**:
+批次新增／更新 reservation 的操作：把試算表（ODS/Excel）複製的多列文字貼入多行輸入框，一次性套用至目前選定的 subnet。每列一筆、欄位以 Tab（該列無 Tab 時退回逗號）分隔，固定順序為 hw-address、ip-address、選用 hostname。以 hw-address 為覆寫鍵：與目前 subnet 內既有筆相符則以匯入的 ip-address／hostname 覆寫，否則新增。整批以單一次寫回落地（單一備份）；被跳過的列（首欄非 MAC 格式、缺或無效的 hw-address／ip-address、IP 衝突）逐筆附原因列入結果。
+_Avoid_: 匯入、批量貼上（僅口語）
 
 **Credential（憑證）**:
 用於驗證操作者身分的共享密碼，設定於 `kealight.toml` 的 `password` 欄位。不與特定用戶綁定，為全站共用。密碼為空字串或缺省時不啟用認證。

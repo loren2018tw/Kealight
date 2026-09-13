@@ -17,7 +17,10 @@ use tokio::sync::Mutex;
 use tower_layer::Layer;
 use tower_service::Service;
 
-use crate::domain::{check_conflicts, duplicate_hostnames, Conflict, Reservation};
+use crate::domain::{
+    check_conflicts, conflict_reasons, duplicate_hostnames, plan_paste, Conflict, PasteAction,
+    PasteMutation, PastePlan, Reservation,
+};
 use crate::file::{backup, file_stat, FileStat, KeaFile, LeaseDb, SubnetSummary};
 use crate::leases::{matches_state_filter, parse as parse_leases, remaining_text, row_state_label, Lease};
 use crate::reload::reload;
@@ -145,6 +148,8 @@ pub fn app(state: AppState) -> Router {
         .route("/subnet/{idx}/new", get(new_form).post(create_reservation))
         .route("/subnet/{idx}/res/{ridx}/edit", get(edit_form).post(update_reservation))
         .route("/subnet/{idx}/res/{ridx}/delete", post(delete_reservation))
+        .route("/subnet/{idx}/paste", get(paste_form).post(commit_paste))
+        .route("/subnet/{idx}/paste/preview", post(preview_paste))
         .route("/apply", post(apply_reload))
         .route("/leases", get(leases_page))
         .route("/external/adopt", post(external_adopt))
@@ -300,6 +305,7 @@ struct ListQuery {
     warn: Option<String>,
     sort: Option<String>,
     dir: Option<String>,
+    paste: Option<String>,
 }
 
 async fn subnet_list(
@@ -412,6 +418,11 @@ fn render_subnet_list(st: &AppState, idx: usize, q: &ListQuery, refresh: &Refres
         .as_deref()
         .map(|h| format!(r#"<p class="warn">⚠ hostname「{}」與其他 reservation 重複（未擋，僅提醒）</p>"#, escape(h)))
         .unwrap_or_default();
+    let paste_html = q
+        .paste
+        .as_deref()
+        .map(|s| format!(r#"<p class="warn">{}</p>"#, escape(s)))
+        .unwrap_or_default();
     let match_phrase = if needle.is_empty() {
         String::new()
     } else {
@@ -457,11 +468,13 @@ fn render_subnet_list(st: &AppState, idx: usize, q: &ListQuery, refresh: &Refres
 <input type="search" name="q" value="{}" placeholder="搜尋 hostname / IP / hw-address（即時篩選）" style="flex:1;min-width:260px"
 hx-get="/subnet/{idx}" hx-trigger="input changed delay:200ms" hx-target="#list-panel" hx-select="#list-panel" hx-swap="outerHTML"{sort_vals}>
 <a class="btn primary" href="/subnet/{idx}/new">新增 reservation</a>
+<a class="btn" href="/subnet/{idx}/paste">快貼新增</a>
 <button class="btn primary{}" hx-post="/apply" hx-target="#apply-result" hx-swap="innerHTML" title="{apply_hint}">套用設定</button>
 <span id="apply-result"></span>
 {pending_html}
 </div>
 {warn_html}
+{paste_html}
 {subnet_selector}
 <div id="list-panel">
 <p>共 {} 筆符合{}{}</p>
@@ -1313,14 +1326,7 @@ fn normalize_mac(s: &str) -> Option<String> {
 }
 
 fn conflict_messages(c: &[Conflict]) -> Vec<String> {
-    c.iter()
-        .map(|x| match x {
-            Conflict::DuplicateHwAddress => "hw-address 已存在（唯一鍵衝突）".to_string(),
-            Conflict::IpInUse => "IP 已被其他 reservation 佔用".to_string(),
-            Conflict::IpInPool => "IP 落在 dynamic pool 範圍內".to_string(),
-            Conflict::IpOutOfSubnet => "IP 超出 subnet 範圍".to_string(),
-        })
-        .collect()
+    conflict_reasons(c)
 }
 
 async fn create_reservation(
@@ -1489,6 +1495,230 @@ async fn edit_form(
         }
         None => page_500("reservation 不存在"),
     }
+}
+
+#[derive(Deserialize)]
+struct PasteForm {
+    raw: String,
+    /// 外部修改決策頁重送時攜帶：adopt | overwrite
+    external_resolve: Option<String>,
+}
+
+async fn paste_form(
+    State(state): State<Shared>,
+    Path(idx): Path<usize>,
+) -> Response {
+    let mut st = state.lock().await;
+    let refresh = st.refresh_external();
+    if st.file.subnet(idx).is_err() {
+        return page_500("subnet 不存在");
+    }
+    let next = format!("/subnet/{idx}/paste");
+    let body = format!(
+        "{}{}{}",
+        tab_strip("hosts", &format!("/subnet/{idx}")),
+        external_banner_html(&refresh, st.saves_since_apply, &next),
+        paste_area_html(idx, "", false),
+    );
+    (StatusCode::OK, Html(page("快貼新增", &body))).into_response()
+}
+
+async fn preview_paste(
+    State(state): State<Shared>,
+    Path(idx): Path<usize>,
+    Form(form): Form<PasteForm>,
+) -> Response {
+    let mut st = state.lock().await;
+    let refresh = st.refresh_external();
+    let subnet = match st.file.subnet(idx) {
+        Ok(s) => s,
+        Err(_) => return page_500("subnet 不存在"),
+    };
+    let plan = plan_paste(&subnet, &form.raw);
+    let next = format!("/subnet/{idx}/paste");
+    let body = format!(
+        "{}{}{}{}",
+        tab_strip("hosts", &format!("/subnet/{idx}")),
+        external_banner_html(&refresh, st.saves_since_apply, &next),
+        paste_area_html(idx, &form.raw, true),
+        paste_preview_html(&plan),
+    );
+    (StatusCode::OK, Html(page("快貼預覽", &body))).into_response()
+}
+
+async fn commit_paste(
+    State(state): State<Shared>,
+    Path(idx): Path<usize>,
+    Form(form): Form<PasteForm>,
+) -> Response {
+    let mut st = state.lock().await;
+    match st.refresh_external() {
+        Refresh::ExternalChanged => {
+            let hidden = format!(r#"<textarea name="raw" hidden>{}</textarea>"#, escape(&form.raw));
+            let intercept = external_decision_page(
+                &format!("/subnet/{idx}/paste"),
+                Some(&hidden),
+                "將依貼上的資料批次新增／更新 reservation。",
+                &format!("/subnet/{idx}"),
+                st.saves_since_apply,
+            );
+            if let Some(resp) = resolve_external(&mut st, form.external_resolve.as_deref(), intercept) {
+                return resp;
+            }
+        }
+        _ => {}
+    }
+    let subnet = match st.file.subnet(idx) {
+        Ok(s) => s,
+        Err(_) => return page_500("subnet 不存在"),
+    };
+    let plan = plan_paste(&subnet, &form.raw);
+    let mut added = 0usize;
+    let mut updated = 0usize;
+    let mut nochange = 0usize;
+    let mut skipped = 0usize;
+    for o in &plan.outcomes {
+        match o.action {
+            PasteAction::Add => added += 1,
+            PasteAction::Update => updated += 1,
+            PasteAction::NoChange => nochange += 1,
+            PasteAction::Skip => skipped += 1,
+        }
+    }
+    if !plan.mutations.is_empty() {
+        for m in plan.mutations {
+            match m {
+                PasteMutation::Update { index, reservation } => {
+                    if let Err(e) = st.file.update_reservation(idx, index, &reservation) {
+                        return page_500(&e.to_string());
+                    }
+                }
+                PasteMutation::Add { reservation } => {
+                    if let Err(e) = st.file.add_reservation(idx, &reservation) {
+                        return page_500(&e.to_string());
+                    }
+                }
+            }
+        }
+        if let Err(e) = st.save_locked() {
+            return page_500(&e.to_string());
+        }
+    }
+    let mut msg = format!("快貼完成：新增 {added}、更新 {updated}、無變化 {nochange}、跳過 {skipped}");
+    if plan.silent_skipped > 0 {
+        msg.push_str(&format!("（另有 {} 列首欄非 MAC 格式，已略過）", plan.silent_skipped));
+    }
+    if !plan.warn_hostnames.is_empty() {
+        msg.push_str(&format!("；hostname 重複 {} 筆（僅警告）", plan.warn_hostnames.len()));
+    }
+    Redirect::to(&format!("/subnet/{idx}?paste={}", urlencode(&msg))).into_response()
+}
+
+/// 快貼的文字輸入區＋動作按鈕。show_confirm 為真時顯示「確認匯入」（預覽頁才出現）。
+fn paste_area_html(idx: usize, raw: &str, show_confirm: bool) -> String {
+    let confirm_btn = if show_confirm {
+        format!(
+            r#"<button class="btn primary" formaction="/subnet/{idx}/paste" formmethod="post">確認匯入</button>"#,
+            idx = idx,
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<div class="bar"><h1 style="margin:0">快貼新增 — Subnet {idx}</h1></div>
+<form method="post" class="bar" style="flex-direction:column;align-items:flex-start">
+<label>貼上試算表複製的多列資料（每列一筆，欄位以 Tab 分隔，順序：hw-address → ip-address → hostname；首欄非 MAC 格式的列會被跳過）：
+<textarea name="raw" rows="8" placeholder="1c:69:7a:77:3b:98&#9;10.1.1.11&#9;hostname&#10;aa:bb:cc:dd:ee:ff&#9;10.1.1.12" style="width:100%;font-family:monospace">{raw_esc}</textarea></label>
+<div class="bar">
+<button class="btn" formaction="/subnet/{idx}/paste/preview" formmethod="post">解析預覽</button>
+{confirm_btn}
+<a class="btn" href="/subnet/{idx}">取消</a>
+</div>
+</form>"#,
+        idx = idx,
+        raw_esc = escape(raw),
+        confirm_btn = confirm_btn,
+    )
+}
+
+/// 快貼預覽結果表：逐筆標示 新增／更新／無變化／跳過（附原因），及靜默跳過與 hostname 警告。
+fn paste_preview_html(plan: &PastePlan) -> String {
+    let mut added = 0usize;
+    let mut updated = 0usize;
+    let mut nochange = 0usize;
+    let mut skipped = 0usize;
+    for o in &plan.outcomes {
+        match o.action {
+            PasteAction::Add => added += 1,
+            PasteAction::Update => updated += 1,
+            PasteAction::NoChange => nochange += 1,
+            PasteAction::Skip => skipped += 1,
+        }
+    }
+    let silent_note = if plan.silent_skipped > 0 {
+        format!("（另有 {} 列因首欄非 MAC 格式被略過）", plan.silent_skipped)
+    } else {
+        String::new()
+    };
+    let warn_note = if plan.warn_hostnames.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = plan.warn_hostnames.iter().map(|h| escape(h)).collect();
+        format!(
+            r#"<p class="warn">⚠ hostname「{}」與其他 reservation 重複（僅警告，不擋）</p>"#,
+            names.join("、")
+        )
+    };
+    let mut rows = String::new();
+    if plan.outcomes.is_empty() {
+        rows.push_str(r#"<tr><td colspan="6"><p class="dim">沒有可識別的資料列</p></td></tr>"#);
+    }
+    for o in &plan.outcomes {
+        let (hw, ip, host) = match o.reservation.as_ref() {
+            Some(r) => (
+                escape(&r.hw_address),
+                r.ip_address.to_string(),
+                escape(r.hostname.as_deref().unwrap_or("")),
+            ),
+            None => (escape(&o.raw.hw), escape(&o.raw.ip), escape(&o.raw.hostname)),
+        };
+        let (label, cls) = match o.action {
+            PasteAction::Add => ("新增", ""),
+            PasteAction::Update => ("更新", ""),
+            PasteAction::NoChange => ("無變化", "dim"),
+            PasteAction::Skip => ("跳過", "err"),
+        };
+        let label_span = if cls.is_empty() {
+            label.to_string()
+        } else {
+            format!(r#"<span class="{cls}">{label}</span>"#)
+        };
+        let detail = o
+            .detail
+            .as_deref()
+            .map(|d| format!(r#"<span class="err">{}</span>"#, escape(d)))
+            .unwrap_or_default();
+        rows.push_str(&format!(
+            r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+            o.line_no, hw, ip, host, label_span, detail,
+        ));
+    }
+    format!(
+        r##"<h2 style="margin-top:1rem">預覽結果</h2>
+<p>新增 {added} · 更新 {updated} · 無變化 {nochange} · 跳過 {skipped}{silent_note}</p>
+{warn_note}
+<table>
+<thead><tr><th>#</th><th>hw-address</th><th>ip-address</th><th>hostname</th><th>處理</th><th>原因</th></tr></thead>
+<tbody>{rows}</tbody>
+</table>"##,
+        added = added,
+        updated = updated,
+        nochange = nochange,
+        skipped = skipped,
+        silent_note = silent_note,
+        warn_note = warn_note,
+        rows = rows,
+    )
 }
 
 /// 決策頁顯示的 reservation 操作摘要（值均已 escape）。
@@ -2481,5 +2711,104 @@ mod tests {
         let (_, body) = get(&app2, "/leases").await;
         assert!(body.contains("非 memfile"), "非 memfile 應顯示空狀態：{body}");
         let _ = std::fs::remove_dir_all(&cleanup);
+    }
+
+    #[tokio::test]
+    async fn paste_preview_shows_classification() {
+        let (app, dir) = test_app();
+        let raw = concat!(
+            "1c:69:7a:77:3b:98\t10.1.1.99\trenamed\n", // 覆寫既有筆（chufang）→ 更新
+            "c0:3f:d5:b4:bb:e3\t10.1.1.13\tdamenjingweishi-cesuoqiujiulingjiankanzhujiAcer-M4630G\n", // 原樣 → 無變化
+            "AA-BB-CC-DD-EE-08\t10.1.9.8\tnewbox\n", // 新筆 → 新增
+            "ea:aa:aa:aa:aa:b1\tbad-ip\tx\n",        // IP 不合法 → 跳過
+            "ea:aa:aa:aa:aa:b2\t10.1.11.100\tpooled\n", // 落入 pool → 跳過
+        );
+        let (status, body) = post_form(&app, "/subnet/0/paste/preview", &format!("raw={}", urlencode(raw))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("新增 1"), "body: {body}");
+        assert!(body.contains("更新 1"), "body: {body}");
+        assert!(body.contains("無變化 1"), "body: {body}");
+        assert!(body.contains("跳過 2"), "body: {body}");
+        assert!(body.contains("renamed"), "body: {body}");
+        assert!(body.contains("dynamic pool"), "body: {body}");
+        assert!(body.contains("ip-address 格式不合法"), "body: {body}");
+        assert!(body.contains("確認匯入"), "預覽頁應有確認按鈕：{body}");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn paste_get_page_renders_textarea() {
+        let (app, dir) = test_app();
+        let (status, body) = get(&app, "/subnet/0/paste").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("快貼新增"), "body: {body}");
+        assert!(body.contains(r#"name="raw""#), "body: {body}");
+        assert!(!body.contains("確認匯入"), "初始頁不應出現確認按鈕：{body}");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn paste_commit_writes_and_redirects_with_summary() {
+        let (app, p) = test_app();
+        let raw = "AA-BB-CC-DD-EE-09\t10.1.9.9\tnewbox\n1c:69:7a:77:3b:98\t10.1.1.99\trenamed\n";
+        let (status, _) = post_form(&app, "/subnet/0/paste", &format!("raw={}", urlencode(raw))).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let reloaded = KeaFile::load(&p).unwrap();
+        let s = reloaded.subnet(0).unwrap();
+        assert_eq!(s.reservations.len(), 240);
+        let last = s.reservations.last().unwrap().clone();
+        assert_eq!(last.hw_address, "aa:bb:cc:dd:ee:09");
+        assert_eq!(last.ip_address.to_string(), "10.1.9.9");
+        assert_eq!(last.hostname.as_deref(), Some("newbox"));
+        assert_eq!(s.reservations[0].ip_address.to_string(), "10.1.1.99");
+        assert_eq!(s.reservations[0].hostname.as_deref(), Some("renamed"));
+        let summary = "快貼完成：新增 1、更新 1、無變化 0、跳過 0";
+        let (status, body) = get(&app, &format!("/subnet/0?paste={}", urlencode(summary))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(summary), "列表應顯示快貼彙總橫幅：{body}");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn paste_commit_with_no_valid_rows_does_not_write() {
+        let (app, p) = test_app();
+        let raw = "something-odd\t10.1.9.9\tx\nea:aa:aa:aa:aa:01\tbad\tx\n";
+        let (status, _) = post_form(&app, "/subnet/0/paste", &format!("raw={}", urlencode(raw))).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let reloaded = KeaFile::load(&p).unwrap();
+        assert_eq!(reloaded.subnet(0).unwrap().reservations.len(), 239, "全數跳過不得寫入");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn paste_commit_intercepts_external_change_then_commits() {
+        let (app, p) = test_app();
+        post_form(
+            &app,
+            "/subnet/0/new",
+            "hw_address=aa%3Abb%3Acc%3Add%3Aee%3A62&ip_address=10.1.9.62",
+        )
+        .await;
+        externally_edit(&p, "aa:bb:cc:dd:ee:63", "10.1.9.63");
+        let raw = "AA-BB-CC-DD-EE-71\t10.1.9.71\tbox71\n";
+        let raw_body = format!("raw={}", urlencode(raw));
+        let (status, intercepted) = post_form(&app, "/subnet/0/paste", &raw_body).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(intercepted.contains("設定檔已被外部修改"), "body: {intercepted}");
+        assert!(intercepted.contains("name=\"raw\""), "決策頁應保留原始貼文：{intercepted}");
+        let (status, _) = post_form(
+            &app,
+            "/subnet/0/paste",
+            &format!("{raw_body}&external_resolve=overwrite"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let reloaded = KeaFile::load(&p).unwrap();
+        assert!(
+            reloaded.reservation_hwaddrs().contains(&"aa:bb:cc:dd:ee:71".into()),
+            "覆寫後快貼應在記憶體版本上寫入：{:?}",
+            reloaded.reservation_hwaddrs()
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }
